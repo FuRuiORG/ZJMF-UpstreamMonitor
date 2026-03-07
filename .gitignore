@@ -6,6 +6,13 @@ upstream_diffs/
 #示例文件
 example/
 
+# 压缩包
+*.zip
+*.tar.gz
+*.tar.bz2
+
+*.txt
+
 # 配置文件（包含敏感信息）
 upstream_config.json
 
