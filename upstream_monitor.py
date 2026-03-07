@@ -178,7 +178,7 @@ class SMTPNotifier:
         self.sender_password = smtp_config.get('sender_password')
         self.recipients = smtp_config.get('recipients', [])
     
-    def send_change_email(self, changes: List[Dict], upstream_name: str, change_type: str = "价格"):
+    def send_change_email(self, changes: List[Dict], upstream_name: str, change_type: str = "价格", reshuffling_info: Dict = None):
         """
         发送变化邮件通知
         
@@ -186,24 +186,24 @@ class SMTPNotifier:
             changes: 变化记录列表
             upstream_name: 上游名称
             change_type: 变化类型（价格/数据）
+            reshuffling_info: 产品重组信息
         """
         if not changes:
             return
         
-        # 创建邮件
         msg = MIMEMultipart('alternative')
         msg['From'] = self.sender_email
         msg['To'] = ', '.join(self.recipients)
-        msg['Subject'] = Header(f"{change_type}变化通知 - {upstream_name} - {datetime.now().strftime('%Y-%m-%d %H:%M')}", 'utf-8')
         
-        # 生成邮件内容
-        text_content = self._generate_text_email(changes, upstream_name, change_type)
-        html_content = self._generate_html_email(changes, upstream_name, change_type)
+        subject_prefix = "⚠️ 产品重组通知" if (reshuffling_info and reshuffling_info.get('is_reshuffling')) else f"{change_type}变化通知"
+        msg['Subject'] = Header(f"{subject_prefix} - {upstream_name} - {datetime.now().strftime('%Y-%m-%d %H:%M')}", 'utf-8')
+        
+        text_content = self._generate_text_email(changes, upstream_name, change_type, reshuffling_info)
+        html_content = self._generate_html_email(changes, upstream_name, change_type, reshuffling_info)
         
         msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
         msg.attach(MIMEText(html_content, 'html', 'utf-8'))
         
-        # 发送邮件
         try:
             server = smtplib.SMTP_SSL(self.smtp_server, self.smtp_port)
             server.login(self.sender_email, self.sender_password)
@@ -236,15 +236,39 @@ class SMTPNotifier:
         except Exception:
             return str(value)[:max_length]
     
-    def _generate_text_email(self, changes: List[Dict], upstream_name: str, change_type: str = "价格") -> str:
+    def _generate_text_email(self, changes: List[Dict], upstream_name: str, change_type: str = "价格", reshuffling_info: Dict = None) -> str:
         """生成纯文本邮件内容"""
         content = f"上游监控 - {change_type}变化通知\n"
         content += f"上游：{upstream_name}\n"
         content += f"检测时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         content += "=" * 60 + "\n\n"
         
+        if reshuffling_info and reshuffling_info.get('is_reshuffling'):
+            content += "【⚠️ 检测到产品信息重组】\n"
+            content += f"类型：{'循环交换' if reshuffling_info.get('reshuffling_type') == 'circular_exchange' else '互换'}\n"
+            content += f"概述：{reshuffling_info.get('summary', 'N/A')}\n\n"
+            
+            for group in reshuffling_info.get('groups', []):
+                content += f"分组：{group.get('group_name', 'N/A')}\n"
+                content += f"涉及产品数：{group.get('reshuffled_count', 0)} 个\n"
+                content += f"模式：{'循环交换' if group.get('is_circular') else '互换'}\n"
+                content += "产品身份转移详情：\n"
+                
+                for mapping in group.get('mappings', []):
+                    content += f"  • 原 ID {mapping.get('original_id')} ({mapping.get('original_name')}，¥{mapping.get('original_price')})\n"
+                    content += f"    → 转移到 ID {mapping.get('moved_to_id')}\n"
+                    content += f"    （该 ID 现在的名称：{mapping.get('new_name_at_old_id')}，价格：¥{mapping.get('new_price_at_old_id')}）\n"
+                
+                content += "\n"
+            
+            content += "=" * 60 + "\n"
+            content += "以下是详细的字段变化记录：\n"
+            content += "=" * 60 + "\n\n"
+        
         for change in changes:
-            # 价格变化
+            if 'is_reshuffling_item' in change:
+                continue
+            
             if 'change_type' in change and change['change_type'] in ['increase', 'decrease']:
                 price_change_type = "涨价" if change['change_type'] == 'increase' else "降价"
                 content += f"【价格变化】\n"
@@ -255,7 +279,6 @@ class SMTPNotifier:
                 content += f"现价：¥{change.get('new_price', 'N/A')}\n"
                 content += f"变化幅度：¥{abs(change.get('price_change', 0)):.2f} ({price_change_type})\n"
                 content += f"购买链接：{change.get('product_url', change.get('upstream_url', ''))}\n"
-            # 数据变化（新增/删除/修改）
             elif 'change_category' in change:
                 category = change['change_category']
                 content += f"【{category}】\n"
@@ -264,7 +287,6 @@ class SMTPNotifier:
                 content += f"产品名称：{change.get('product_name', 'N/A')}\n"
                 content += f"所属分组：{change.get('group_name', 'N/A')}\n"
                 content += f"修改字段：{change.get('field_name', 'N/A')}\n"
-                # 添加产品链接
                 upstream_url = change.get('upstream_url', '')
                 first_group_id = change.get('first_group_id', '')
                 second_group_id = change.get('second_group_id', '')
@@ -281,112 +303,589 @@ class SMTPNotifier:
         
         return content
     
-    def _generate_html_email(self, changes: List[Dict], upstream_name: str, change_type: str = "价格") -> str:
+    def _generate_html_email(self, changes: List[Dict], upstream_name: str, change_type: str = "价格", reshuffling_info: Dict = None) -> str:
         """生成 HTML 邮件内容"""
         html = f"""
-        <html>
+        <!DOCTYPE html>
+        <html lang="zh-CN">
         <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>上游监控通知</title>
             <style>
-                body {{ font-family: Arial, sans-serif; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-                th {{ background-color: #4CAF50; color: white; }}
-                .increase {{ background-color: #ffcccc; }}
-                .decrease {{ background-color: #ccffcc; }}
-                .price-up {{ color: red; font-weight: bold; }}
-                .price-down {{ color: green; font-weight: bold; }}
-                .added {{ background-color: #ccffcc; }}
-                .removed {{ background-color: #ffcccc; }}
-                .modified {{ background-color: #ffffcc; }}
-                a {{ color: #0066cc; text-decoration: none; }}
-                a:hover {{ text-decoration: underline; }}
-                pre {{ background-color: #f4f4f4; padding: 10px; border-radius: 4px; overflow-x: auto; }}
+                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+                
+                body {{
+                    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'HarmonyOS Sans', sans-serif;
+                    background-color: #ffffff;
+                    color: #171717;
+                    margin: 0;
+                    padding: 0;
+                    line-height: 1.6;
+                }}
+                
+                .email-container {{
+                    max-width: 640px;
+                    margin: 0 auto;
+                    padding: 40px 24px;
+                }}
+                
+                .header {{
+                    border-bottom: 1px solid #e5e5e5;
+                    padding-bottom: 24px;
+                    margin-bottom: 32px;
+                }}
+                
+                .logo {{
+                    font-size: 18px;
+                    font-weight: 600;
+                    color: #171717;
+                    letter-spacing: -0.02em;
+                    margin-bottom: 16px;
+                }}
+                
+                .title {{
+                    font-size: 24px;
+                    font-weight: 600;
+                    color: #171717;
+                    letter-spacing: -0.02em;
+                    margin: 0 0 8px 0;
+                }}
+                
+                .subtitle {{
+                    font-size: 14px;
+                    color: #737373;
+                    margin: 0;
+                }}
+                
+                .meta-info {{
+                    background-color: #fafafa;
+                    border: 1px solid #e5e5e5;
+                    padding: 16px 20px;
+                    margin-bottom: 24px;
+                }}
+                
+                .meta-row {{
+                    display: flex;
+                    justify-content: space-between;
+                    font-size: 13px;
+                    margin-bottom: 8px;
+                }}
+                
+                .meta-row:last-child {{
+                    margin-bottom: 0;
+                }}
+                
+                .meta-label {{
+                    color: #737373;
+                }}
+                
+                .meta-value {{
+                    color: #171717;
+                    font-weight: 500;
+                }}
+                
+                .reshuffling-banner {{
+                    background-color: #171717;
+                    color: #ffffff;
+                    padding: 20px 24px;
+                    margin-bottom: 24px;
+                }}
+                
+                .reshuffling-banner h3 {{
+                    font-size: 16px;
+                    font-weight: 600;
+                    margin: 0 0 8px 0;
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }}
+                
+                .reshuffling-banner p {{
+                    font-size: 13px;
+                    color: #a3a3a3;
+                    margin: 4px 0;
+                }}
+                
+                .reshuffling-group {{
+                    background-color: #fafafa;
+                    border: 1px solid #e5e5e5;
+                    border-left: 2px solid #171717;
+                    padding: 16px 20px;
+                    margin-bottom: 16px;
+                }}
+                
+                .reshuffling-group h4 {{
+                    font-size: 14px;
+                    font-weight: 600;
+                    color: #171717;
+                    margin: 0 0 12px 0;
+                }}
+                
+                .reshuffling-group p {{
+                    font-size: 13px;
+                    color: #525252;
+                    margin: 0 0 4px 0;
+                }}
+                
+                .mapping-item {{
+                    background-color: #ffffff;
+                    border: 1px solid #e5e5e5;
+                    padding: 12px 16px;
+                    margin-top: 12px;
+                    font-size: 13px;
+                }}
+                
+                .mapping-item strong {{
+                    color: #171717;
+                }}
+                
+                .mapping-item small {{
+                    color: #737373;
+                }}
+                
+                .section-title {{
+                    font-size: 14px;
+            font-weight: 600;
+                    color: #171717;
+                    margin: 32px 0 16px 0;
+                    padding-bottom: 8px;
+                    border-bottom: 1px solid #e5e5e5;
+                }}
+                
+                .change-card {{
+                    border: 1px solid #e5e5e5;
+                    margin-bottom: 1px;
+                }}
+                
+                .change-card:last-child {{
+                    margin-bottom: 16px;
+                }}
+                
+                .change-header {{
+                    padding: 12px 16px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    border-bottom: 1px solid #f5f5f5;
+                }}
+                
+                .change-type {{
+                    font-size: 12px;
+                    font-weight: 600;
+                    letter-spacing: 0.02em;
+                    padding: 4px 8px;
+                }}
+                
+                .type-price-up {{
+                    background-color: #fef2f2;
+                    color: #dc2626;
+                }}
+                
+                .type-price-down {{
+                    background-color: #f0fdf4;
+                    color: #16a34a;
+                }}
+                
+                .type-added {{
+                    background-color: #f0fdf4;
+                    color: #16a34a;
+                }}
+                
+                .type-removed {{
+                    background-color: #fef2f2;
+                    color: #dc2626;
+                }}
+                
+                .type-modified {{
+                    background-color: #fffbeb;
+                    color: #d97706;
+                }}
+                
+                .change-body {{
+                    padding: 16px;
+                }}
+                
+                .change-row {{
+                    font-size: 13px;
+                    margin-bottom: 8px;
+                    display: flex;
+                }}
+                
+                .change-row:last-child {{
+                    margin-bottom: 0;
+                }}
+                
+                .change-label {{
+                    color: #737373;
+                    min-width: 80px;
+                }}
+                
+                .change-value {{
+                    color: #171717;
+                    flex: 1;
+                }}
+                
+                .price-change {{
+                    font-weight: 600;
+                }}
+                
+                .price-up {{
+                    color: #dc2626;
+                }}
+                
+                .price-down {{
+                    color: #16a34a;
+                }}
+                
+                .change-link {{
+                    color: #171717;
+                    text-decoration: underline;
+                    text-underline-offset: 2px;
+                }}
+                
+                .change-link:hover {{
+                    color: #525252;
+                }}
+                
+                .code-block {{
+                    background-color: #fafafa;
+                    border: 1px solid #e5e5e5;
+                    padding: 12px 16px;
+                    font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace;
+                    font-size: 12px;
+                    overflow-x: auto;
+                    white-space: pre-wrap;
+                    word-break: break-all;
+                    max-height: 200px;
+                    overflow-y: auto;
+                }}
+                
+                .footer {{
+                    margin-top: 40px;
+                    padding-top: 24px;
+                    border-top: 1px solid #e5e5e5;
+                    text-align: center;
+                }}
+                
+                .footer p {{
+                    font-size: 12px;
+                    color: #a3a3a3;
+                    margin: 0;
+                }}
+                
+                .stats-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(4, 1fr);
+                    gap: 1px;
+                    background-color: #e5e5e5;
+                    border: 1px solid #e5e5e5;
+                    margin-bottom: 24px;
+                }}
+                
+                .stat-item {{
+                    background-color: #ffffff;
+                    padding: 16px;
+                    text-align: center;
+                }}
+                
+                .stat-number {{
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: #171717;
+                }}
+                
+                .stat-label {{
+                    font-size: 11px;
+                    color: #737373;
+                    margin-top: 4px;
+                }}
             </style>
         </head>
         <body>
-            <h2>上游监控 - {change_type}变化通知</h2>
-            <p><strong>上游：</strong>{upstream_name}</p>
-            <p><strong>检测时间：</strong>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            <p><strong>变化数量：</strong>{len(changes)} 条</p>
-            
-            <table>
-                <tr>
-                    <th>变化类型</th>
-                    <th>详细信息</th>
-                </tr>
+            <div class="email-container">
+                <div class="header">
+                    <div class="logo">FuRuiORG Monitor</div>
+                    <h1 class="title">{change_type}变化通知</h1>
+                    <p class="subtitle">上游产品监控检测到数据变化</p>
+                </div>
+                
+                <div class="meta-info">
+                    <div class="meta-row">
+                        <span class="meta-label">上游</span>
+                        <span class="meta-value">{upstream_name}</span>
+                    </div>
+                    <div class="meta-row">
+                        <span class="meta-label">检测时间</span>
+                        <span class="meta-value">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</span>
+                    </div>
+                    <div class="meta-row">
+                        <span class="meta-label">变化数量</span>
+                        <span class="meta-value">{len(changes)} 条</span>
+                    </div>
+                </div>
         """
         
+        price_increase_count = sum(1 for c in changes if c.get('change_type') == 'increase')
+        price_decrease_count = sum(1 for c in changes if c.get('change_type') == 'decrease')
+        added_count = sum(1 for c in changes if c.get('change_category') == '新增')
+        removed_count = sum(1 for c in changes if c.get('change_category') == '删除')
+        modified_count = sum(1 for c in changes if c.get('change_category') == '修改')
+        reshuffling_item_count = sum(1 for c in changes if 'is_reshuffling_item' in c)
+        
+        field_name_map = {
+            'id': '产品ID',
+            'name': '产品名称',
+            'description': '产品描述',
+            'product_price': '价格',
+            'stock_control': '库存控制',
+            'qty': '库存数量',
+            'type': '产品类型',
+            'billingcycle': '计费周期',
+            'setup_fee': '初装费',
+            'ontrial': '试用设置',
+            'headline': '标题',
+            'tagline': '标语',
+            'fields': '自定义字段',
+        }
+        
+        def get_field_display_name(field_name):
+            return field_name_map.get(field_name, field_name)
+        
+        modified_fields = set()
+        for c in changes:
+            if c.get('field_name'):
+                display_name = get_field_display_name(c.get('field_name'))
+                modified_fields.add(display_name)
+            elif c.get('change_type') in ['increase', 'decrease']:
+                modified_fields.add('价格')
+        
+        html += f"""
+                <div class="section-title">变化概况</div>
+                <div class="stats-grid" style="grid-template-columns: repeat(5, 1fr);">
+                    <div class="stat-item">
+                        <div class="stat-number" style="color: #dc2626;">{price_increase_count}</div>
+                        <div class="stat-label">涨价</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" style="color: #16a34a;">{price_decrease_count}</div>
+                        <div class="stat-label">降价</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" style="color: #d97706;">{modified_count}</div>
+                        <div class="stat-label">修改</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" style="color: #16a34a;">{added_count}</div>
+                        <div class="stat-label">新增</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" style="color: #dc2626;">{removed_count}</div>
+                        <div class="stat-label">删除</div>
+                    </div>
+                </div>
+        """
+        
+        if modified_fields:
+            fields_str = '、'.join(sorted(modified_fields))
+            total_modified = modified_count + price_increase_count + price_decrease_count
+            html += f"""
+                <div class="meta-info" style="margin-bottom: 24px;">
+                    <div class="meta-row">
+                        <span class="meta-label">涉及字段</span>
+                        <span class="meta-value">{fields_str}</span>
+                    </div>
+                    <div class="meta-row">
+                        <span class="meta-label">总变化数</span>
+                        <span class="meta-value">{total_modified} 条</span>
+                    </div>
+                </div>
+        """
+        
+        if reshuffling_info and reshuffling_info.get('is_reshuffling'):
+            reshuffling_type_text = '循环交换' if reshuffling_info.get('reshuffling_type') == 'circular_exchange' else '互换'
+            html += f"""
+                <div class="reshuffling-banner">
+                    <h3>⚠️ 检测到产品信息重组</h3>
+                    <p><strong>类型：</strong>{reshuffling_type_text}</p>
+                    <p><strong>概述：</strong>{reshuffling_info.get('summary', 'N/A')}</p>
+                </div>
+                
+                <div class="section-title">重组详情</div>
+            """
+            
+            for group in reshuffling_info.get('groups', []):
+                group_type = '循环交换' if group.get('is_circular') else '互换'
+                html += f"""
+                <div class="reshuffling-group">
+                    <h4>分组：{group.get('group_name', 'N/A')}</h4>
+                    <p><strong>涉及产品数：</strong>{group.get('reshuffled_count', 0)} 个</p>
+                    <p><strong>模式：</strong>{group_type}</p>
+                    <p style="margin-top: 12px;"><strong>产品身份转移详情：</strong></p>
+                """
+                
+                for mapping in group.get('mappings', []):
+                    html += f"""
+                    <div class="mapping-item">
+                        <strong>原 ID {mapping.get('original_id')}</strong> 
+                        ({mapping.get('original_name')}，¥{mapping.get('original_price')})<br>
+                        → <strong>转移到 ID {mapping.get('moved_to_id')}</strong><br>
+                        <small>（该 ID 现在的名称：{mapping.get('new_name_at_old_id')}，价格：¥{mapping.get('new_price_at_old_id')}）</small>
+                    </div>
+                    """
+                
+                html += "</div>"
+            
+            html += """
+                <div class="section-title">详细字段变化记录</div>
+            """
+        
+        reshuffling_product_ids = set()
+        if reshuffling_info and reshuffling_info.get('is_reshuffling'):
+            for group in reshuffling_info.get('groups', []):
+                for mapping in group.get('mappings', []):
+                    reshuffling_product_ids.add(str(mapping.get('original_id')))
+        
+        change_index = 0
         for change in changes:
-            # 价格变化
+            if 'is_reshuffling_item' in change:
+                continue
+            
+            change_index += 1
+            is_reshuffling_product = str(change.get('product_id', '')) in reshuffling_product_ids
+            
             if 'change_type' in change and change['change_type'] in ['increase', 'decrease']:
                 price_change_type = "涨价" if change['change_type'] == 'increase' else "降价"
-                change_class = "increase" if change['change_type'] == 'increase' else "decrease"
+                type_class = "type-price-up" if change['change_type'] == 'increase' else "type-price-down"
                 price_class = "price-up" if change['change_type'] == 'increase' else "price-down"
+                arrow = "↑" if change['change_type'] == 'increase' else "↓"
                 product_url = change.get('product_url', change.get('upstream_url', ''))
                 
+                reshuffling_badge = '<span class="change-type" style="background-color: #171717; color: #fff; margin-left: 8px;">重组</span><span style="font-size: 11px; color: #737373; margin-left: 8px;">（修改内容可能不准确，仅参考）</span>' if is_reshuffling_product else ''
+                
                 html += f"""
-                <tr class="{change_class}">
-                    <td><strong>【价格变化】{price_change_type}</strong></td>
-                    <td>
-                        <strong>产品：</strong>{change.get('product_name', 'N/A')}<br>
-                        <strong>分组：</strong>{change.get('group_name', 'N/A')}<br>
-                        <strong>产品 ID：</strong>{change.get('product_id', 'N/A')}<br>
-                        <strong>原价：</strong>¥{change.get('old_price', 'N/A')}<br>
-                        <strong>现价：</strong>¥{change.get('new_price', 'N/A')}<br>
-                        <strong>变化：</strong><span class="{price_class}">{'↑' if change['change_type'] == 'increase' else '↓'} ¥{abs(change.get('price_change', 0)):.2f}</span><br>
-                        <strong>链接：</strong><a href="{product_url}">查看产品</a>
-                    </td>
-                </tr>
+                <div class="change-card">
+                    <div class="change-header">
+                        <span style="font-size: 13px; font-weight: 500; color: #171717;"><span style="color: #737373; margin-right: 8px;">#{change_index}</span>{change.get('product_name', 'N/A')}</span>
+                        <div>
+                            <span class="change-type {type_class}">{price_change_type}</span>{reshuffling_badge}
+                        </div>
+                    </div>
+                    <div class="change-body">
+                        <div class="change-row">
+                            <span class="change-label">所属分组</span>
+                            <span class="change-value">{change.get('group_name', 'N/A')}</span>
+                        </div>
+                        <div class="change-row">
+                            <span class="change-label">产品 ID</span>
+                            <span class="change-value">{change.get('product_id', 'N/A')}</span>
+                        </div>
+                        <div class="change-row">
+                            <span class="change-label">原价</span>
+                            <span class="change-value">¥{change.get('old_price', 'N/A')}</span>
+                        </div>
+                        <div class="change-row">
+                            <span class="change-label">现价</span>
+                            <span class="change-value">¥{change.get('new_price', 'N/A')}</span>
+                        </div>
+                        <div class="change-row">
+                            <span class="change-label">变化幅度</span>
+                            <span class="change-value price-change {price_class}">{arrow} ¥{abs(change.get('price_change', 0)):.2f}</span>
+                        </div>
+                        <div class="change-row">
+                            <span class="change-label">购买链接</span>
+                            <span class="change-value"><a href="{product_url}" class="change-link">查看产品</a></span>
+                        </div>
+                    </div>
+                </div>
                 """
-            # 数据变化（新增/删除/修改）
             elif 'change_category' in change:
                 category = change['change_category']
                 if category == "新增":
-                    change_class = "added"
+                    type_class = "type-added"
                 elif category == "删除":
-                    change_class = "removed"
+                    type_class = "type-removed"
                 else:
-                    change_class = "modified"
+                    type_class = "type-modified"
+                
+                reshuffling_badge = '<span class="change-type" style="background-color: #171717; color: #fff; margin-left: 8px;">重组</span><span style="font-size: 11px; color: #737373; margin-left: 8px;">（修改内容可能不准确，仅参考）</span>' if is_reshuffling_product else ''
+                
+                field_display_name = get_field_display_name(change.get('field_name', 'N/A'))
                 
                 html += f"""
-                <tr class="{change_class}">
-                    <td><strong>【{category}】</strong></td>
-                    <td>
-                        <strong>上游：</strong>{change.get('upstream_name', 'N/A')}<br>
-                        <strong>产品ID：</strong>{change.get('product_id', 'N/A')}<br>
-                        <strong>产品名称：</strong>{change.get('product_name', 'N/A')}<br>
-                        <strong>所属分组：</strong>{change.get('group_name', 'N/A')}<br>
-                        <strong>修改字段：</strong>{change.get('field_name', 'N/A')}<br>
+                <div class="change-card">
+                    <div class="change-header">
+                        <span style="font-size: 13px; font-weight: 500; color: #171717;"><span style="color: #737373; margin-right: 8px;">#{change_index}</span>{change.get('product_name', 'N/A')}</span>
+                        <div>
+                            <span class="change-type {type_class}">{category}</span>{reshuffling_badge}
+                        </div>
+                    </div>
+                    <div class="change-body">
+                        <div class="change-row">
+                            <span class="change-label">上游</span>
+                            <span class="change-value">{change.get('upstream_name', 'N/A')}</span>
+                        </div>
+                        <div class="change-row">
+                            <span class="change-label">产品 ID</span>
+                            <span class="change-value">{change.get('product_id', 'N/A')}</span>
+                        </div>
+                        <div class="change-row">
+                            <span class="change-label">所属分组</span>
+                            <span class="change-value">{change.get('group_name', 'N/A')}</span>
+                        </div>
+                        <div class="change-row">
+                            <span class="change-label">修改字段</span>
+                            <span class="change-value">{field_display_name}</span>
+                        </div>
                 """
-                # 添加产品链接
                 upstream_url = change.get('upstream_url', '')
                 first_group_id = change.get('first_group_id', '')
                 second_group_id = change.get('second_group_id', '')
                 if upstream_url and first_group_id and second_group_id:
-                    html += f"""<strong>产品链接：</strong><a href="{upstream_url}/cart?fid={first_group_id}&gid={second_group_id}">查看产品</a><br>"""
+                    html += f"""
+                        <div class="change-row">
+                            <span class="change-label">产品链接</span>
+                            <span class="change-value"><a href="{upstream_url}/cart?fid={first_group_id}&gid={second_group_id}" class="change-link">查看产品</a></span>
+                        </div>
+                    """
                 
                 if category == "修改":
                     html += f"""
-                        <strong>旧值：</strong><pre>{self._format_value_for_email(change.get('old_value', ''), 1000)}</pre><br>
-                        <strong>新值：</strong><pre>{self._format_value_for_email(change.get('new_value', ''), 1000)}</pre>
+                        <div class="change-row" style="flex-direction: column;">
+                            <span class="change-label" style="margin-bottom: 8px;">旧值</span>
+                            <div class="code-block">{self._format_value_for_email(change.get('old_value', ''), 1000)}</div>
+                        </div>
+                        <div class="change-row" style="flex-direction: column; margin-top: 12px;">
+                            <span class="change-label" style="margin-bottom: 8px;">新值</span>
+                            <div class="code-block">{self._format_value_for_email(change.get('new_value', ''), 1000)}</div>
+                        </div>
                     """
                 else:
                     html += f"""
-                        <strong>值：</strong><pre>{self._format_value_for_email(change.get('new_value', change.get('value', '')), 1000)}</pre>
+                        <div class="change-row" style="flex-direction: column;">
+                            <span class="change-label" style="margin-bottom: 8px;">值</span>
+                            <div class="code-block">{self._format_value_for_email(change.get('new_value', change.get('value', '')), 1000)}</div>
+                        </div>
                     """
-                html += "</td></tr>"
+                html += "</div></div>"
             else:
                 html += f"""
-                <tr>
-                    <td><strong>【其他变化】</strong></td>
-                    <td><pre>{self._format_value_for_email(change, 1000)}</pre></td>
-                </tr>
+                <div class="change-card">
+                    <div class="change-header">
+                        <span style="font-size: 13px; font-weight: 500; color: #171717;"><span style="color: #737373; margin-right: 8px;">#{change_index}</span>其他变化</span>
+                        <span class="change-type type-modified">其他</span>
+                    </div>
+                    <div class="change-body">
+                        <div class="code-block">{self._format_value_for_email(change, 1000)}</div>
+                    </div>
+                </div>
                 """
         
         html += """
-            </table>
-            <br>
-            <p style="color: #666; font-size: 12px;">此邮件由上游监控系统自动发送</p>
+                <div class="footer">
+                    <p>此邮件由 FuRuiORG 上游监控系统自动发送</p>
+                </div>
+            </div>
         </body>
         </html>
         """
@@ -711,6 +1210,192 @@ class UpstreamMonitor:
         
         return changes
 
+    def _detect_product_reshuffling(self, old_data: dict, new_data: dict,
+                                    upstream_name: str, upstream_url: str) -> Dict:
+        """
+        检测产品信息重组模式
+        
+        产品重组是指：多个产品之间发生了身份交换（名称、价格、配置等属性整体转移）
+        典型特征：
+        1. 同一分组内多个产品的ID发生了循环交换
+        2. 产品的属性（名称、描述、价格等）从一个ID转移到了另一个ID
+        
+        Args:
+            old_data: 旧数据
+            new_data: 新数据
+            upstream_name: 上游名称
+            upstream_url: 上游 URL
+            
+        Returns:
+            重组检测结果，包含是否检测到重组、重组详情等
+        """
+        result = {
+            "is_reshuffling": False,
+            "reshuffling_type": None,
+            "groups": [],
+            "summary": ""
+        }
+        
+        old_products = self._extract_products(old_data, upstream_name, upstream_url)
+        new_products = self._extract_products(new_data, upstream_name, upstream_url)
+        
+        old_by_id = {p['product_id']: p for p in old_products}
+        new_by_id = {p['product_id']: p for p in new_products}
+        
+        old_by_group = {}
+        for p in old_products:
+            group_key = f"{p['first_group_id']}|{p['second_group_id']}"
+            if group_key not in old_by_group:
+                old_by_group[group_key] = {'name': p['group_name'], 'products': []}
+            old_by_group[group_key]['products'].append(p)
+        
+        new_by_group = {}
+        for p in new_products:
+            group_key = f"{p['first_group_id']}|{p['second_group_id']}"
+            if group_key not in new_by_group:
+                new_by_group[group_key] = {'name': p['group_name'], 'products': []}
+            new_by_group[group_key]['products'].append(p)
+        
+        reshuffling_groups = []
+        
+        for group_key in old_by_group:
+            if group_key not in new_by_group:
+                continue
+            
+            old_group = old_by_group[group_key]
+            new_group = new_by_group[group_key]
+            
+            old_ids = set(p['product_id'] for p in old_group['products'])
+            new_ids = set(p['product_id'] for p in new_group['products'])
+            
+            if old_ids != new_ids:
+                continue
+            
+            if len(old_group['products']) < 2:
+                continue
+            
+            id_mapping = {}
+            identity_mappings = []
+            
+            for old_p in old_group['products']:
+                old_id = old_p['product_id']
+                new_p = new_by_id.get(old_id)
+                
+                if not new_p:
+                    continue
+                
+                identity_match = None
+                
+                if new_p['product_name'] == old_p['product_name'] and new_p['original_price'] == old_p['original_price']:
+                    continue
+                
+                for candidate_p in old_group['products']:
+                    candidate_id = candidate_p['product_id']
+                    if candidate_id == old_id:
+                        continue
+                    
+                    new_candidate = new_by_id.get(candidate_id)
+                    if not new_candidate:
+                        continue
+                    
+                    name_match = old_p['product_name'] == new_candidate['product_name']
+                    price_match = old_p['original_price'] == new_candidate['original_price']
+                    
+                    old_desc = self._get_product_description(old_data, old_id)
+                    new_desc = self._get_product_description(new_data, candidate_id)
+                    desc_match = old_desc == new_desc
+                    
+                    if name_match and price_match and desc_match:
+                        identity_match = candidate_id
+                        break
+                
+                if identity_match:
+                    id_mapping[old_id] = {
+                        'target_id': identity_match,
+                        'old_product': old_p,
+                        'new_product': new_by_id[identity_match]
+                    }
+                    identity_mappings.append({
+                        'original_id': old_id,
+                        'original_name': old_p['product_name'],
+                        'original_price': old_p['original_price'],
+                        'moved_to_id': identity_match,
+                        'new_name_at_old_id': new_p['product_name'],
+                        'new_price_at_old_id': new_p['original_price']
+                    })
+            
+            if len(identity_mappings) >= 2:
+                is_circular = self._check_circular_mapping(identity_mappings)
+                
+                reshuffling_groups.append({
+                    'group_name': old_group['name'],
+                    'group_key': group_key,
+                    'product_count': len(old_group['products']),
+                    'reshuffled_count': len(identity_mappings),
+                    'is_circular': is_circular,
+                    'mappings': identity_mappings
+                })
+        
+        if reshuffling_groups:
+            total_reshuffled = sum(g['reshuffled_count'] for g in reshuffling_groups)
+            has_circular = any(g['is_circular'] for g in reshuffling_groups)
+            
+            result['is_reshuffling'] = True
+            result['reshuffling_type'] = 'circular_exchange' if has_circular else 'direct_swap'
+            result['groups'] = reshuffling_groups
+            
+            if len(reshuffling_groups) == 1:
+                g = reshuffling_groups[0]
+                if g['is_circular']:
+                    result['summary'] = f"检测到分组「{g['group_name']}」内 {g['reshuffled_count']} 个产品发生了循环交换"
+                else:
+                    result['summary'] = f"检测到分组「{g['group_name']}」内 {g['reshuffled_count']} 个产品发生了互换"
+            else:
+                group_names = '、'.join(g['group_name'] for g in reshuffling_groups)
+                result['summary'] = f"检测到 {len(reshuffling_groups)} 个分组（{group_names}）共 {total_reshuffled} 个产品发生了重组"
+        
+        return result
+    
+    def _get_product_description(self, data: dict, product_id: str) -> str:
+        """从数据中获取产品描述"""
+        try:
+            if 'data' in data and 'first_group' in data['data']:
+                for first_group in data['data']['first_group']:
+                    if 'group' in first_group:
+                        for group in first_group['group']:
+                            if 'products' in group:
+                                for product in group['products']:
+                                    if str(product.get('id', '')) == str(product_id):
+                                        return product.get('description', '')
+        except Exception:
+            pass
+        return ''
+    
+    def _check_circular_mapping(self, mappings: List[Dict]) -> bool:
+        """检查映射是否形成循环"""
+        if len(mappings) < 2:
+            return False
+        
+        id_to_target = {m['original_id']: m['moved_to_id'] for m in mappings}
+        
+        visited = set()
+        for start_id in id_to_target:
+            if start_id in visited:
+                continue
+            
+            chain = []
+            current = start_id
+            while current in id_to_target and current not in chain:
+                chain.append(current)
+                current = id_to_target[current]
+            
+            if current == start_id and len(chain) > 1:
+                return True
+            
+            visited.update(chain)
+        
+        return False
+
     def _save_changes_to_db(self, changes: List[Dict], check_time: str):
         """
         保存变化记录到数据库
@@ -811,6 +1496,11 @@ class UpstreamMonitor:
         price_changes = self._check_price_changes(old_data, new_data, name, base_url)
         print(f"检测到 {len(price_changes)} 个产品价格变化")
         
+        # 检测产品重组
+        reshuffling_info = self._detect_product_reshuffling(old_data, new_data, name, base_url)
+        if reshuffling_info.get('is_reshuffling'):
+            print(f"⚠️ 检测到产品信息重组：{reshuffling_info.get('summary', '')}")
+        
         # 保存差异文件 - 只保存差异部分
         diff_file = self._get_diff_file(name, timestamp)
         
@@ -832,10 +1522,12 @@ class UpstreamMonitor:
                 "added_count": len(diff["added"]),
                 "removed_count": len(diff["removed"]),
                 "modified_count": len(diff["modified"]),
-                "price_changes_count": len(price_changes)
+                "price_changes_count": len(price_changes),
+                "is_reshuffling": reshuffling_info.get('is_reshuffling', False)
             },
             "diff": filtered_diff,
-            "price_changes": price_changes
+            "price_changes": price_changes,
+            "reshuffling_info": reshuffling_info if reshuffling_info.get('is_reshuffling') else None
         }
         
         with open(diff_file, "w", encoding="utf-8") as f:
@@ -1097,7 +1789,7 @@ class UpstreamMonitor:
                 all_changes.extend(product_changes)
             
             if all_changes:
-                self.notifier.send_change_email(all_changes, name, "数据")
+                self.notifier.send_change_email(all_changes, name, "数据", reshuffling_info)
                 # 保存变化记录到数据库
                 self._save_changes_to_db(all_changes, timestamp.isoformat())
                 print(f"✓ 已保存 {len(all_changes)} 条变化记录到数据库")
@@ -1113,7 +1805,8 @@ class UpstreamMonitor:
             "has_changes": True,
             "diff_file": str(diff_file),
             "summary": diff_result["summary"],
-            "price_changes": len(price_changes)
+            "price_changes": len(price_changes),
+            "reshuffling_info": reshuffling_info if reshuffling_info.get('is_reshuffling') else None
         }
 
     def run(self):
@@ -1146,11 +1839,16 @@ class UpstreamMonitor:
                 print(f"✓ {upstream_name}: 数据无变化")
             else:
                 summary = result.get("summary", {})
-                print(f"✓ {upstream_name}: 检测到变化 "
-                      f"(新增:{summary.get('added_count', 0)}, "
-                      f"删除:{summary.get('removed_count', 0)}, "
-                      f"修改:{summary.get('modified_count', 0)}, "
-                      f"价格变化:{summary.get('price_changes_count', 0)})")
+                reshuffling_info = result.get("reshuffling_info")
+                
+                if reshuffling_info and reshuffling_info.get('is_reshuffling'):
+                    print(f"⚠️ {upstream_name}: 检测到产品重组！{reshuffling_info.get('summary', '')}")
+                else:
+                    print(f"✓ {upstream_name}: 检测到变化 "
+                          f"(新增:{summary.get('added_count', 0)}, "
+                          f"删除:{summary.get('removed_count', 0)}, "
+                          f"修改:{summary.get('modified_count', 0)}, "
+                          f"价格变化:{summary.get('price_changes_count', 0)})")
         
         return results
 
