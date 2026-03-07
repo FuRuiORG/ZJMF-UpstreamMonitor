@@ -1,0 +1,15 @@
+{
+  "upstreams": [
+    {
+      "name": "XX云",
+      "base_url": "https://www.XXX.com/",
+      "api_url": "https://www.XXX.com/v1/products",
+      "enabled": true
+    }
+  ],
+  "request_headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json"
+  },
+  "timeout": 30
+}
