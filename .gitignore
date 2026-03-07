@@ -13,6 +13,9 @@ example/
 
 *.txt
 
+#UI参考
+index.html
+
 # 配置文件（包含敏感信息）
 upstream_config.json
 
