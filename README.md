@@ -45,8 +45,6 @@ ZJMF-UpstreamMonitor/
 ├── upstream_config.json         # 配置文件
 ├── upstream_data/               # 初始数据存储目录
 │   └── {上游名称}_initial.json
-├── upstream_diffs/              # 差异数据文件目录
-│   └── {上游名称}_{时间戳}.json
 └── upstream_monitor.db          # SQLite 数据库文件
 ```
 
@@ -56,8 +54,6 @@ ZJMF-UpstreamMonitor/
 ├── upstream_config.json         # 配置文件
 ├── upstream_data/               # 初始数据存储目录
 │   └── {上游名称}_initial.json
-├── upstream_diffs/              # 差异数据文件目录
-│   └── {上游名称}_{时间戳}.json
 └── upstream_monitor.db          # SQLite 数据库文件
 ```
 
