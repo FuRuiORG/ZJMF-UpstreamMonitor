@@ -22,6 +22,10 @@
 - ✅ **交互式配置** - 命令行配置向导，便捷配置上游和邮件
 - ✅ **跨平台支持** - Windows/Linux 自动适配数据目录
 
+## 邮件通知截图
+<img width="673" height="2261" alt="image" src="https://github.com/user-attachments/assets/8b2639e5-fbac-4cf3-b62d-0edd1ac5542d" />
+
+
 ## 项目结构
 
 ```
