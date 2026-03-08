@@ -1,5 +1,7 @@
 # ZJMF 上游产品信息监控器
 
+> 📖 **快速开始**：查看 [安装文档](INSTALL.md) 获取详细的部署指南
+
 监控多个上游 URL 的产品信息变化，自动保存差异到 JSON 文件，支持邮件通知和价格历史数据库记录。
 
 **⚠️ 重要提示（Linux 用户）**  
@@ -105,7 +107,7 @@ pip install -r requirements.txt
 运行配置向导：
 
 ```bash
-python upstream_monitor.py --config
+python3 upstream_monitor.py --config
 ```
 
 配置向导界面：
@@ -132,7 +134,7 @@ python upstream_monitor.py --config
 ### 配置模式
 
 ```bash
-python upstream_monitor.py --config
+python3 upstream_monitor.py --config
 ```
 
 配置向导功能：
@@ -145,7 +147,7 @@ python upstream_monitor.py --config
 ### 监控模式
 
 ```bash
-python upstream_monitor.py
+python3 upstream_monitor.py
 ```
 
 首次运行会：
@@ -297,7 +299,7 @@ sudo systemctl start upstream-monitor.timer
 
 ### 配置文件问题
 
-1. 运行 `python upstream_monitor.py --config` 重新配置
+1. 运行 `python3 upstream_monitor.py --config` 重新配置
 2. 检查 JSON 格式是否正确
 
 ## 许可证
