@@ -8,18 +8,24 @@
 import json
 import os
 import sys
+import time
 import hashlib
 import sqlite3
 import smtplib
+import logging
 import platform
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
 
 import requests
+
+# 配置日志
+logger = logging.getLogger(__name__)
 
 
 def get_data_dir() -> Path:
@@ -56,50 +62,58 @@ class DatabaseManager:
         self.db_path = db_path
         self._init_database()
     
+    @contextmanager
+    def _get_connection(self):
+        """获取数据库连接的上下文管理器"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
     def _init_database(self):
         """初始化数据库表结构"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # 变化记录表（包含价格变化和其他字段变化）
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS change_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_id TEXT,
-                product_name TEXT,
-                upstream_name TEXT NOT NULL,
-                upstream_url TEXT,
-                group_name TEXT,
-                first_group_id TEXT,
-                second_group_id TEXT,
-                change_type TEXT NOT NULL,
-                field_name TEXT,
-                old_value TEXT,
-                new_value TEXT,
-                price_change REAL,
-                check_time TIMESTAMP NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # 创建索引
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_changes_product 
-            ON change_records(product_id, upstream_name)
-        ''')
-        
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_changes_time 
-            ON change_records(check_time)
-        ''')
-        
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_changes_type 
-            ON change_records(change_type)
-        ''')
-        
-        conn.commit()
-        conn.close()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # 变化记录表（包含价格变化和其他字段变化）
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS change_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_id TEXT,
+                    product_name TEXT,
+                    upstream_name TEXT NOT NULL,
+                    upstream_url TEXT,
+                    group_name TEXT,
+                    first_group_id TEXT,
+                    second_group_id TEXT,
+                    change_type TEXT NOT NULL,
+                    field_name TEXT,
+                    old_value TEXT,
+                    new_value TEXT,
+                    price_change REAL,
+                    check_time TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # 创建索引
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_changes_product 
+                ON change_records(product_id, upstream_name)
+            ''')
+            
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_changes_time 
+                ON change_records(check_time)
+            ''')
+            
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_changes_type 
+                ON change_records(change_type)
+            ''')
+            
+            conn.commit()
     
     def save_change_record(self, change_data: Dict):
         """
@@ -108,33 +122,32 @@ class DatabaseManager:
         Args:
             change_data: 变化数据
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO change_records 
-            (product_id, product_name, upstream_name, upstream_url, 
-             group_name, first_group_id, second_group_id,
-             change_type, field_name, old_value, new_value, price_change, check_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            change_data.get('product_id'),
-            change_data.get('product_name'),
-            change_data['upstream_name'],
-            change_data.get('upstream_url'),
-            change_data.get('group_name'),
-            change_data.get('first_group_id'),
-            change_data.get('second_group_id'),
-            change_data['change_type'],
-            change_data.get('field_name'),
-            change_data.get('old_value'),
-            change_data.get('new_value'),
-            change_data.get('price_change'),
-            change_data['check_time']
-        ))
-        
-        conn.commit()
-        conn.close()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO change_records 
+                (product_id, product_name, upstream_name, upstream_url, 
+                 group_name, first_group_id, second_group_id,
+                 change_type, field_name, old_value, new_value, price_change, check_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                change_data.get('product_id'),
+                change_data.get('product_name'),
+                change_data['upstream_name'],
+                change_data.get('upstream_url'),
+                change_data.get('group_name'),
+                change_data.get('first_group_id'),
+                change_data.get('second_group_id'),
+                change_data['change_type'],
+                change_data.get('field_name'),
+                change_data.get('old_value'),
+                change_data.get('new_value'),
+                change_data.get('price_change'),
+                change_data['check_time']
+            ))
+            
+            conn.commit()
     
     def get_recent_changes(self, hours: int = 24) -> List[Dict]:
         """
@@ -146,20 +159,18 @@ class DatabaseManager:
         Returns:
             价格变化记录列表
         """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT * FROM price_changes 
-            WHERE created_at >= datetime('now', ?)
-            ORDER BY created_at DESC
-        ''', (f'-{hours} hours',))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        return [dict(row) for row in rows]
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT * FROM change_records 
+                WHERE created_at >= datetime('now', ?)
+                ORDER BY created_at DESC
+            ''', (f'-{hours} hours',))
+            
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
 
 
 class SMTPNotifier:
@@ -211,6 +222,7 @@ class SMTPNotifier:
             server.quit()
             print(f"✓ 邮件通知已发送（{len(changes)} 条价格变化）")
         except Exception as e:
+            logger.error(f"邮件发送失败：{str(e)}")
             print(f"✗ 邮件发送失败：{str(e)}")
     
     def _format_value_for_email(self, value: Any, max_length: int = 500) -> str:
@@ -896,6 +908,24 @@ class SMTPNotifier:
 class UpstreamMonitor:
     """上游产品信息监控器"""
     
+    @staticmethod
+    def get_stock_notify_mode(config: Dict) -> str:
+        """
+        获取库存通知模式，支持新旧配置格式
+        
+        Args:
+            config: 配置字典
+            
+        Returns:
+            库存通知模式：'full', 'status_only', 或 'disabled'
+        """
+        stock_notify_mode = config.get('stock_notify_mode')
+        if stock_notify_mode is None:
+            # 向后兼容旧配置 compare_stock
+            compare_stock = config.get('compare_stock', True)
+            stock_notify_mode = "disabled" if not compare_stock else "full"
+        return stock_notify_mode
+    
     def __init__(self, config_file: str = None):
         """
         初始化监控器
@@ -972,25 +1002,64 @@ class UpstreamMonitor:
         safe_name = "".join(c for c in name if c.isalnum() or c in " _-")
         return self.data_dir / f"{safe_name}_initial.json"
 
-    def _fetch_data(self, url: str) -> dict:
+    def _fetch_data(self, url: str, max_retries: int = 3, retry_delay: float = 1.0) -> dict:
         """
-        获取上游数据
+        获取上游数据，支持重试
 
         Args:
             url: API URL
+            max_retries: 最大重试次数
+            retry_delay: 基础重试延迟（秒），实际使用指数退避
 
         Returns:
             获取的数据
+
+        Raises:
+            Exception: 所有重试失败后抛出最后一次错误
         """
         headers = self.config.get("request_headers", {})
         timeout = self.config.get("timeout", 30)
         
-        response = requests.get(url, headers=headers, timeout=timeout)
-        response.raise_for_status()
+        last_error: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, headers=headers, timeout=timeout)
+                response.raise_for_status()
+                return response.json()
+            except (requests.RequestException, json.JSONDecodeError) as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    actual_delay = retry_delay * (2 ** attempt)  # 指数退避
+                    logger.warning(f"请求失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+                    print(f"请求失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+                    print(f"将在 {actual_delay:.1f} 秒后重试...")
+                    time.sleep(actual_delay)
         
-        return response.json()
+        logger.error(f"请求最终失败: {url}")
+        raise last_error or Exception("未知错误")
 
-    def _compare_data(self, old_data: Any, new_data: Any, path: str = "") -> dict:
+    # 库存相关字段列表
+    STOCK_FIELDS = {'qty', 'stock_control'}
+    
+    def _get_stock_status(self, value: Any) -> str:
+        """
+        获取库存状态
+        
+        Args:
+            value: 库存值
+            
+        Returns:
+            'in_stock' 或 'out_of_stock'
+        """
+        if value is None:
+            return 'out_of_stock'
+        try:
+            num_value = float(value)
+            return 'in_stock' if num_value > 0 else 'out_of_stock'
+        except (ValueError, TypeError):
+            return 'out_of_stock'
+    
+    def _compare_data(self, old_data: Any, new_data: Any, path: str = "", stock_notify_mode: str = "full") -> dict:
         """
         比较两个数据集的差异
 
@@ -998,6 +1067,10 @@ class UpstreamMonitor:
             old_data: 旧数据
             new_data: 新数据
             path: 当前路径（用于递归）
+            stock_notify_mode: 库存通知模式
+                - "full": 完全对比库存变化（默认）
+                - "status_only": 只在库存状态变化时通知（有货↔无货）
+                - "disabled": 不监控库存
 
         Returns:
             差异信息
@@ -1017,6 +1090,11 @@ class UpstreamMonitor:
             
             # 新增的键
             for key in new_keys - old_keys:
+                # 库存字段处理
+                if key in self.STOCK_FIELDS:
+                    if stock_notify_mode == "disabled":
+                        continue
+                    # status_only 模式下，新增字段也算状态变化（从无到有）
                 diff["added"].append({
                     "path": f"{path}.{key}" if path else key,
                     "value": new_data[key]
@@ -1024,6 +1102,11 @@ class UpstreamMonitor:
             
             # 删除的键
             for key in old_keys - new_keys:
+                # 库存字段处理
+                if key in self.STOCK_FIELDS:
+                    if stock_notify_mode == "disabled":
+                        continue
+                    # status_only 模式下，删除字段也算状态变化
                 diff["removed"].append({
                     "path": f"{path}.{key}" if path else key,
                     "value": old_data[key]
@@ -1031,10 +1114,57 @@ class UpstreamMonitor:
             
             # 修改的键
             for key in old_keys & new_keys:
+                # 库存字段特殊处理
+                if key in self.STOCK_FIELDS:
+                    if stock_notify_mode == "disabled":
+                        diff["unchanged"] += 1
+                        continue
+                    
+                    old_value = old_data[key]
+                    new_value = new_data[key]
+                    
+                    # 值相同，跳过
+                    if old_value == new_value:
+                        diff["unchanged"] += 1
+                        continue
+                    
+                    # status_only 模式：只在状态变化时记录
+                    if stock_notify_mode == "status_only":
+                        old_status = self._get_stock_status(old_value)
+                        new_status = self._get_stock_status(new_value)
+                        
+                        if old_status == new_status:
+                            # 状态未变化，跳过
+                            diff["unchanged"] += 1
+                            continue
+                        
+                        # 状态变化，记录并添加状态信息
+                        diff["modified"].append({
+                            "path": f"{path}.{key}" if path else key,
+                            "old_value": old_value,
+                            "new_value": new_value,
+                            "stock_status_change": {
+                                "old_status": old_status,
+                                "new_status": new_status,
+                                "change_text": "缺货" if new_status == "out_of_stock" else "补货"
+                            },
+                            "detail": {"added": [], "removed": [], "modified": [], "unchanged": 0}
+                        })
+                    else:
+                        # full 模式：记录所有变化
+                        diff["modified"].append({
+                            "path": f"{path}.{key}" if path else key,
+                            "old_value": old_value,
+                            "new_value": new_value,
+                            "detail": {"added": [], "removed": [], "modified": [], "unchanged": 0}
+                        })
+                    continue
+                    
                 sub_diff = self._compare_data(
                     old_data[key], 
                     new_data[key], 
-                    f"{path}.{key}" if path else key
+                    f"{path}.{key}" if path else key,
+                    stock_notify_mode=stock_notify_mode
                 )
                 
                 if sub_diff["added"] or sub_diff["removed"] or sub_diff["modified"]:
@@ -1063,7 +1193,8 @@ class UpstreamMonitor:
                     sub_diff = self._compare_data(
                         old_item, 
                         new_item, 
-                        f"{path}[{i}]"
+                        f"{path}[{i}]",
+                        stock_notify_mode=stock_notify_mode
                     )
                     
                     if sub_diff["added"] or sub_diff["removed"] or sub_diff["modified"]:
@@ -1143,29 +1274,23 @@ class UpstreamMonitor:
                                         'check_time': datetime.now().isoformat()
                                     })
         except Exception as e:
+            logger.error(f"提取产品信息时出错：{str(e)}")
             print(f"提取产品信息时出错：{str(e)}")
         
         return products
 
-    def _check_price_changes(self, old_data: dict, new_data: dict, 
-                            upstream_name: str, upstream_url: str) -> List[Dict]:
+    def _check_price_changes(self, old_products: List[Dict], new_products: List[Dict]) -> List[Dict]:
         """
         检查价格变化
         
         Args:
-            old_data: 旧数据
-            new_data: 新数据
-            upstream_name: 上游名称
-            upstream_url: 上游 URL
+            old_products: 旧产品列表（已提取）
+            new_products: 新产品列表（已提取）
             
         Returns:
             价格变化列表
         """
         changes = []
-        
-        # 提取新旧产品数据
-        old_products = self._extract_products(old_data, upstream_name, upstream_url)
-        new_products = self._extract_products(new_data, upstream_name, upstream_url)
         
         # 创建产品 ID 到产品的映射
         old_product_map = {p['product_id']: p for p in old_products}
@@ -1187,8 +1312,8 @@ class UpstreamMonitor:
                     changes.append({
                         'product_id': product_id,
                         'product_name': new_product['product_name'],
-                        'upstream_name': upstream_name,
-                        'upstream_url': upstream_url,
+                        'upstream_name': new_product['upstream_name'],
+                        'upstream_url': new_product['upstream_url'],
                         'group_name': new_product['group_name'],
                         'first_group_id': new_product['first_group_id'],
                         'second_group_id': new_product['second_group_id'],
@@ -1202,8 +1327,8 @@ class UpstreamMonitor:
         
         return changes
 
-    def _detect_product_reshuffling(self, old_data: dict, new_data: dict,
-                                    upstream_name: str, upstream_url: str) -> Dict:
+    def _detect_product_reshuffling(self, old_products: List[Dict], new_products: List[Dict],
+                                    old_desc_map: Dict[str, str], new_desc_map: Dict[str, str]) -> Dict:
         """
         检测产品信息重组模式
         
@@ -1213,10 +1338,10 @@ class UpstreamMonitor:
         2. 产品的属性（名称、描述、价格等）从一个ID转移到了另一个ID
         
         Args:
-            old_data: 旧数据
-            new_data: 新数据
-            upstream_name: 上游名称
-            upstream_url: 上游 URL
+            old_products: 旧产品列表（已提取）
+            new_products: 新产品列表（已提取）
+            old_desc_map: 旧产品描述映射
+            new_desc_map: 新产品描述映射
             
         Returns:
             重组检测结果，包含是否检测到重组、重组详情等
@@ -1227,9 +1352,6 @@ class UpstreamMonitor:
             "groups": [],
             "summary": ""
         }
-        
-        old_products = self._extract_products(old_data, upstream_name, upstream_url)
-        new_products = self._extract_products(new_data, upstream_name, upstream_url)
         
         old_by_id = {p['product_id']: p for p in old_products}
         new_by_id = {p['product_id']: p for p in new_products}
@@ -1293,8 +1415,9 @@ class UpstreamMonitor:
                     name_match = old_p['product_name'] == new_candidate['product_name']
                     price_match = old_p['original_price'] == new_candidate['original_price']
                     
-                    old_desc = self._get_product_description(old_data, old_id)
-                    new_desc = self._get_product_description(new_data, candidate_id)
+                    # 使用预构建的描述映射
+                    old_desc = old_desc_map.get(old_id, '')
+                    new_desc = new_desc_map.get(candidate_id, '')
                     desc_match = old_desc == new_desc
                     
                     if name_match and price_match and desc_match:
@@ -1348,8 +1471,9 @@ class UpstreamMonitor:
         
         return result
     
-    def _get_product_description(self, data: dict, product_id: str) -> str:
-        """从数据中获取产品描述"""
+    def _build_product_description_map(self, data: dict) -> Dict[str, str]:
+        """构建产品ID到描述的映射，提高效率"""
+        desc_map = {}
         try:
             if 'data' in data and 'first_group' in data['data']:
                 for first_group in data['data']['first_group']:
@@ -1357,11 +1481,11 @@ class UpstreamMonitor:
                         for group in first_group['group']:
                             if 'products' in group:
                                 for product in group['products']:
-                                    if str(product.get('id', '')) == str(product_id):
-                                        return product.get('description', '')
+                                    product_id = str(product.get('id', ''))
+                                    desc_map[product_id] = product.get('description', '')
         except Exception:
             pass
-        return ''
+        return desc_map
     
     def _check_circular_mapping(self, mappings: List[Dict]) -> bool:
         """检查映射是否形成循环"""
@@ -1482,14 +1606,33 @@ class UpstreamMonitor:
         # 比较差异
         print(f"检测到数据变化，正在比较差异...")
         timestamp = datetime.now()
-        diff = self._compare_data(old_data, new_data)
+        
+        # 获取库存通知模式（支持新旧配置格式）
+        stock_notify_mode = self.get_stock_notify_mode(self.config)
+        
+        mode_text = {
+            "full": "完全对比库存",
+            "status_only": "仅在库存状态变化时通知（有货↔无货）",
+            "disabled": "已禁用库存对比"
+        }
+        print(f"  （库存模式：{mode_text.get(stock_notify_mode, stock_notify_mode)}）")
+        
+        diff = self._compare_data(old_data, new_data, stock_notify_mode=stock_notify_mode)
+        
+        # 预先提取产品信息和描述映射（避免重复计算）
+        old_products = self._extract_products(old_data, name, base_url)
+        new_products = self._extract_products(new_data, name, base_url)
+        old_desc_map = self._build_product_description_map(old_data)
+        new_desc_map = self._build_product_description_map(new_data)
         
         # 检查价格变化
-        price_changes = self._check_price_changes(old_data, new_data, name, base_url)
+        price_changes = self._check_price_changes(old_products, new_products)
         print(f"检测到 {len(price_changes)} 个产品价格变化")
         
         # 检测产品重组
-        reshuffling_info = self._detect_product_reshuffling(old_data, new_data, name, base_url)
+        reshuffling_info = self._detect_product_reshuffling(
+            old_products, new_products, old_desc_map, new_desc_map
+        )
         if reshuffling_info.get('is_reshuffling'):
             print(f"⚠️ 检测到产品信息重组：{reshuffling_info.get('summary', '')}")
         
@@ -1842,10 +1985,11 @@ class ConfigWizard:
             print("3. 修改上游")
             print("4. 删除上游")
             print("5. 配置邮件通知")
-            print("6. 保存并退出")
+            print("6. 配置库存对比")
+            print("7. 保存并退出")
             print("0. 退出不保存")
             
-            choice = input("\n请输入选项 [0-6]: ").strip()
+            choice = input("\n请输入选项 [0-7]: ").strip()
             
             if choice == "1":
                 self._show_config(config)
@@ -1858,6 +2002,8 @@ class ConfigWizard:
             elif choice == "5":
                 self._config_email(config)
             elif choice == "6":
+                self._config_stock_compare(config)
+            elif choice == "7":
                 self._save_config(config)
                 print("\n✓ 配置已保存")
                 break
@@ -1907,6 +2053,16 @@ class ConfigWizard:
                 print(f"     Base: {upstream.get('base_url', 'N/A')}")
         else:
             print("\n暂无上游配置")
+        
+        # 显示库存对比配置
+        stock_notify_mode = UpstreamMonitor.get_stock_notify_mode(config)
+        
+        mode_text = {
+            "full": "完全对比",
+            "status_only": "状态变化通知",
+            "disabled": "已禁用"
+        }
+        print(f"\n库存监控: {mode_text.get(stock_notify_mode, stock_notify_mode)}")
         
         # 显示邮件配置
         email = config.get("email", {})
@@ -2060,6 +2216,43 @@ class ConfigWizard:
             email["recipients"] = [r.strip() for r in recipients.split(",") if r.strip()]
         
         print("\n✓ 邮件配置已更新")
+    
+    def _config_stock_compare(self, config: dict):
+        """配置库存对比"""
+        print("\n--- 配置库存监控 ---")
+        
+        # 获取当前模式（支持新旧配置格式）
+        stock_notify_mode = UpstreamMonitor.get_stock_notify_mode(config)
+        
+        mode_text = {
+            "full": "完全对比 - 监控所有库存变化",
+            "status_only": "状态变化 - 仅在有货/缺货状态切换时通知",
+            "disabled": "禁用 - 不监控库存变化"
+        }
+        
+        print(f"\n当前设置: {mode_text.get(stock_notify_mode, stock_notify_mode)}")
+        print("\n请选择库存监控模式：")
+        print("  1. 完全对比 - 监控所有库存数量变化")
+        print("  2. 状态变化 - 仅在库存状态切换时通知（有货↔缺货）")
+        print("  3. 禁用监控 - 完全不监控库存变化")
+        
+        choice = input("\n请选择 [1-3]: ").strip()
+        
+        if choice == "1":
+            config["stock_notify_mode"] = "full"
+            # 清理旧配置
+            config.pop("compare_stock", None)
+            print("\n✓ 已设置为完全对比库存变化")
+        elif choice == "2":
+            config["stock_notify_mode"] = "status_only"
+            config.pop("compare_stock", None)
+            print("\n✓ 已设置为仅在库存状态变化时通知")
+        elif choice == "3":
+            config["stock_notify_mode"] = "disabled"
+            config.pop("compare_stock", None)
+            print("\n✓ 已禁用库存监控")
+        else:
+            print("\n无效选项，保持原设置")
 
 
 def main():
