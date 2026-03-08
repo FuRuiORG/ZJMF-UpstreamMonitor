@@ -907,11 +907,9 @@ class UpstreamMonitor:
             config_file = str(DATA_DIR / "upstream_config.json")
         self.config_file = Path(config_file)
         self.data_dir = DATA_DIR / "upstream_data"
-        self.diff_dir = DATA_DIR / "upstream_diffs"
         
         # 创建数据目录
         self.data_dir.mkdir(exist_ok=True)
-        self.diff_dir.mkdir(exist_ok=True)
         
         # 加载配置
         self.config = self._load_config()
@@ -973,12 +971,6 @@ class UpstreamMonitor:
         """获取初始数据文件路径"""
         safe_name = "".join(c for c in name if c.isalnum() or c in " _-")
         return self.data_dir / f"{safe_name}_initial.json"
-
-    def _get_diff_file(self, name: str, timestamp: datetime) -> Path:
-        """获取差异文件路径"""
-        safe_name = "".join(c for c in name if c.isalnum() or c in " _-")
-        time_str = timestamp.strftime("%Y%m%d_%H%M%S")
-        return self.diff_dir / f"{safe_name}_{time_str}.json"
 
     def _fetch_data(self, url: str) -> dict:
         """
@@ -1501,39 +1493,7 @@ class UpstreamMonitor:
         if reshuffling_info.get('is_reshuffling'):
             print(f"⚠️ 检测到产品信息重组：{reshuffling_info.get('summary', '')}")
         
-        # 保存差异文件 - 只保存差异部分
-        diff_file = self._get_diff_file(name, timestamp)
-        
-        # 过滤掉未变化的内容，只保留有变化的部分
-        filtered_diff = {
-            "path": diff.get("path", ""),
-            "added": diff.get("added", []),
-            "removed": diff.get("removed", []),
-            "modified": diff.get("modified", [])
-        }
-        
-        diff_result = {
-            "timestamp": timestamp.isoformat(),
-            "upstream": name,
-            "api_url": api_url,
-            "old_hash": old_hash,
-            "new_hash": new_hash,
-            "summary": {
-                "added_count": len(diff["added"]),
-                "removed_count": len(diff["removed"]),
-                "modified_count": len(diff["modified"]),
-                "price_changes_count": len(price_changes),
-                "is_reshuffling": reshuffling_info.get('is_reshuffling', False)
-            },
-            "diff": filtered_diff,
-            "price_changes": price_changes,
-            "reshuffling_info": reshuffling_info if reshuffling_info.get('is_reshuffling') else None
-        }
-        
-        with open(diff_file, "w", encoding="utf-8") as f:
-            json.dump(diff_result, f, ensure_ascii=False, indent=2)
-        
-        print(f"✓ 差异已保存到：{diff_file}")
+        print(f"检测到变化：")
         print(f"  - 新增：{len(diff['added'])} 项")
         print(f"  - 删除：{len(diff['removed'])} 项")
         print(f"  - 修改：{len(diff['modified'])} 项")
@@ -1803,8 +1763,13 @@ class UpstreamMonitor:
             "success": True,
             "upstream": name,
             "has_changes": True,
-            "diff_file": str(diff_file),
-            "summary": diff_result["summary"],
+            "summary": {
+                "added_count": len(diff["added"]),
+                "removed_count": len(diff["removed"]),
+                "modified_count": len(diff["modified"]),
+                "price_changes_count": len(price_changes),
+                "is_reshuffling": reshuffling_info.get('is_reshuffling', False)
+            },
             "price_changes": len(price_changes),
             "reshuffling_info": reshuffling_info if reshuffling_info.get('is_reshuffling') else None
         }
