@@ -1179,7 +1179,64 @@ class UpstreamMonitor:
         
         # 如果是列表
         elif isinstance(old_data, list) and isinstance(new_data, list):
-            if len(old_data) != len(new_data):
+            # 检测是否是 products 列表，需要按产品ID匹配而不是按索引
+            is_products_list = path.endswith('.products') or path.endswith('products')
+            
+            if is_products_list:
+                # 按 ID 匹配产品，避免顺序变化导致误报
+                old_by_id = {}
+                new_by_id = {}
+                
+                for item in old_data:
+                    if isinstance(item, dict) and 'id' in item:
+                        old_by_id[str(item['id'])] = item
+                
+                for item in new_data:
+                    if isinstance(item, dict) and 'id' in item:
+                        new_by_id[str(item['id'])] = item
+                
+                old_ids = set(old_by_id.keys())
+                new_ids = set(new_by_id.keys())
+                
+                # 新增的产品
+                for product_id in new_ids - old_ids:
+                    new_item = new_by_id[product_id]
+                    diff["added"].append({
+                        "path": f"{path}[id:{product_id}]",
+                        "value": new_item
+                    })
+                
+                # 删除的产品
+                for product_id in old_ids - new_ids:
+                    old_item = old_by_id[product_id]
+                    diff["removed"].append({
+                        "path": f"{path}[id:{product_id}]",
+                        "value": old_item
+                    })
+                
+                # 修改的产品（同一个ID的产品内容变化）
+                for product_id in old_ids & new_ids:
+                    old_item = old_by_id[product_id]
+                    new_item = new_by_id[product_id]
+                    
+                    sub_diff = self._compare_data(
+                        old_item,
+                        new_item,
+                        f"{path}[id:{product_id}]",
+                        stock_notify_mode=stock_notify_mode
+                    )
+                    
+                    if sub_diff["added"] or sub_diff["removed"] or sub_diff["modified"]:
+                        diff["modified"].append({
+                            "path": f"{path}[id:{product_id}]",
+                            "old_value": old_item,
+                            "new_value": new_item,
+                            "detail": sub_diff
+                        })
+                    else:
+                        diff["unchanged"] += sub_diff["unchanged"]
+            
+            elif len(old_data) != len(new_data):
                 diff["modified"].append({
                     "path": path,
                     "old_value": old_data,
@@ -1521,6 +1578,16 @@ class UpstreamMonitor:
             check_time: 检测时间
         """
         for change in changes:
+            # 处理 old_value 和 new_value，确保可以存入数据库
+            old_value = change.get("old_value") or change.get("old_price")
+            new_value = change.get("new_value") or change.get("new_price")
+            
+            # 如果是字典或列表，转换为 JSON 字符串
+            if isinstance(old_value, (dict, list)):
+                old_value = json.dumps(old_value, ensure_ascii=False)
+            if isinstance(new_value, (dict, list)):
+                new_value = json.dumps(new_value, ensure_ascii=False)
+            
             change_record = {
                 "product_id": change.get("product_id"),
                 "product_name": change.get("product_name"),
@@ -1531,8 +1598,8 @@ class UpstreamMonitor:
                 "second_group_id": change.get("second_group_id"),
                 "change_type": change.get("change_type") or change.get("change_category", "修改"),
                 "field_name": change.get("field_name"),
-                "old_value": change.get("old_value") or change.get("old_price"),
-                "new_value": change.get("new_value") or change.get("new_price"),
+                "old_value": old_value,
+                "new_value": new_value,
                 "price_change": change.get("price_change"),
                 "check_time": check_time
             }
@@ -1736,7 +1803,47 @@ class UpstreamMonitor:
                 def get_product_info_from_path(path, old_data_full, new_data_full):
                     """从路径获取产品或分组信息"""
                     import re
-                    # 匹配产品级别路径: data.first_group[数字].group[数字].products[数字]
+                    # 匹配产品级别路径（新格式）: products[id:xxx] 或 data.first_group[数字].group[数字].products[id:xxx]
+                    product_id_match = re.search(r'products\[id:([^\]]+)\]', path)
+                    if product_id_match:
+                        target_product_id = product_id_match.group(1)
+                        
+                        # 在数据中按ID查找产品
+                        def find_product_by_id(data_full, target_id):
+                            try:
+                                if 'data' in data_full and 'first_group' in data_full['data']:
+                                    for first_group in data_full['data']['first_group']:
+                                        first_group_id = str(first_group.get('id', ''))
+                                        if 'group' in first_group:
+                                            for group in first_group['group']:
+                                                second_group_id = str(group.get('id', ''))
+                                                group_name = group.get('name', '未分组')
+                                                if 'products' in group:
+                                                    for product in group['products']:
+                                                        if str(product.get('id', '')) == target_id:
+                                                            return {
+                                                                "type": "product",
+                                                                "product_id": str(product.get('id', 'N/A')),
+                                                                "product_name": product.get('name', 'N/A'),
+                                                                "group_name": group_name,
+                                                                "first_group_id": first_group_id,
+                                                                "second_group_id": second_group_id
+                                                            }
+                            except Exception:
+                                pass
+                            return None
+                        
+                        # 优先从新数据中查找
+                        result = find_product_by_id(new_data_full, target_product_id)
+                        if result:
+                            return result
+                        
+                        # 如果新数据中没有，从旧数据中查找
+                        result = find_product_by_id(old_data_full, target_product_id)
+                        if result:
+                            return result
+                    
+                    # 匹配产品级别路径（旧格式兼容）: data.first_group[数字].group[数字].products[数字]
                     product_match = re.search(r'first_group\[(\d+)\]\.group\[(\d+)\]\.products\[(\d+)\]', path)
                     if product_match:
                         first_group_idx = int(product_match.group(1))
