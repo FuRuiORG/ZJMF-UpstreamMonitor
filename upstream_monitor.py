@@ -284,6 +284,7 @@ class SMTPNotifier:
             if 'change_type' in change and change['change_type'] in ['increase', 'decrease']:
                 price_change_type = "涨价" if change['change_type'] == 'increase' else "降价"
                 content += f"【价格变化】\n"
+                content += f"上游：{change.get('upstream_name', 'N/A')}\n"
                 content += f"产品名称：{change.get('product_name', 'N/A')}\n"
                 content += f"所属分组：{change.get('group_name', 'N/A')}\n"
                 content += f"产品 ID: {change.get('product_id', 'N/A')}\n"
@@ -309,6 +310,8 @@ class SMTPNotifier:
                     content += f"新值：{self._format_value_for_email(change.get('new_value', 'N/A'))}\n"
                 else:
                     content += f"值：{self._format_value_for_email(change.get('new_value', change.get('value', 'N/A')))}\n"
+                if category == "删除":
+                    content += "\n⚠️ 请尽快处理，若确认被上游删除，请立即删除/隐藏对应产品！\n"
             else:
                 content += f"变化：{self._format_value_for_email(change)}\n"
             content += "-" * 40 + "\n"
@@ -785,6 +788,10 @@ class SMTPNotifier:
                     </div>
                     <div class="change-body">
                         <div class="change-row">
+                            <span class="change-label">上游</span>
+                            <span class="change-value">{change.get('upstream_name', 'N/A')}</span>
+                        </div>
+                        <div class="change-row">
                             <span class="change-label">所属分组</span>
                             <span class="change-value">{change.get('group_name', 'N/A')}</span>
                         </div>
@@ -877,6 +884,13 @@ class SMTPNotifier:
                         <div class="change-row" style="flex-direction: column;">
                             <span class="change-label" style="margin-bottom: 8px;">值</span>
                             <div class="code-block">{self._format_value_for_email(change.get('new_value', change.get('value', '')), 1000)}</div>
+                        </div>
+                    """
+                if category == "删除":
+                    html += f"""
+                        <div style="margin-top: 16px; padding: 12px 16px; background-color: #fef2f2; border: 1px solid #fecaca; border-left: 4px solid #dc2626;">
+                            <div style="font-size: 13px; font-weight: 600; color: #dc2626; margin-bottom: 4px;">⚠️ 请尽快处理</div>
+                            <div style="font-size: 12px; color: #7f1d1d;">若确认被上游删除，请立即删除/隐藏对应产品！</div>
                         </div>
                     """
                 html += "</div></div>"
