@@ -220,7 +220,30 @@ class SMTPNotifier:
             server.login(self.sender_email, self.sender_password)
             server.sendmail(self.sender_email, self.recipients, msg.as_string())
             server.quit()
-            print(f"✓ 邮件通知已发送（{len(changes)} 条价格变化）")
+            
+            # 统计各类变化数量
+            price_count = sum(1 for c in changes if c.get('change_type') in ['increase', 'decrease'])
+            added_count = sum(1 for c in changes if c.get('change_category') == '新增')
+            removed_count = sum(1 for c in changes if c.get('change_category') == '删除')
+            modified_count = sum(1 for c in changes if c.get('change_category') == '修改')
+            
+            # 构建日志信息
+            parts = []
+            if price_count > 0:
+                parts.append(f"价格变化 {price_count} 条")
+            if added_count > 0:
+                parts.append(f"新增 {added_count} 条")
+            if removed_count > 0:
+                parts.append(f"删除 {removed_count} 条")
+            if modified_count > 0:
+                parts.append(f"修改 {modified_count} 条")
+            
+            if parts:
+                detail = "，".join(parts)
+            else:
+                detail = f"{len(changes)} 条变化"
+            
+            print(f"✓ 邮件通知已发送（{detail}）")
         except Exception as e:
             logger.error(f"邮件发送失败：{str(e)}")
             print(f"✗ 邮件发送失败：{str(e)}")
@@ -962,7 +985,8 @@ class UpstreamMonitor:
         self.db = DatabaseManager()
         
         # 初始化 SMTP 通知器
-        smtp_config = self.config.get('smtp', {})
+        # 支持 email 和 smtp 两种配置键名（配置向导使用 email，旧配置使用 smtp）
+        smtp_config = self.config.get('email') or self.config.get('smtp', {})
         if smtp_config.get('enabled', False):
             self.notifier = SMTPNotifier(smtp_config)
         else:
@@ -986,7 +1010,7 @@ class UpstreamMonitor:
                     "Accept": "application/json"
                 },
                 "timeout": 30,
-                "smtp": {
+                "email": {
                     "enabled": False,
                     "smtp_server": "smtp.qq.com",
                     "smtp_port": 465,
@@ -1251,14 +1275,53 @@ class UpstreamMonitor:
                         diff["unchanged"] += sub_diff["unchanged"]
             
             elif len(old_data) != len(new_data):
-                diff["modified"].append({
-                    "path": path,
-                    "old_value": old_data,
-                    "new_value": new_data,
-                    "change_type": "length_changed",
-                    "old_length": len(old_data),
-                    "new_length": len(new_data)
-                })
+                # 列表长度变化时，需要处理新增/删除的元素
+                # 对于非 products 列表（如分组列表），需要递归处理新增元素中的产品
+                
+                # 先处理共有的元素（按索引比较）
+                for i, (old_item, new_item) in enumerate(zip(old_data, new_data)):
+                    sub_diff = self._compare_data(
+                        old_item, 
+                        new_item, 
+                        f"{path}[{i}]",
+                        stock_notify_mode=stock_notify_mode
+                    )
+                    
+                    if sub_diff["added"] or sub_diff["removed"] or sub_diff["modified"]:
+                        diff["modified"].append({
+                            "path": f"{path}[{i}]",
+                            "old_value": old_item,
+                            "new_value": new_item,
+                            "detail": sub_diff
+                        })
+                    else:
+                        diff["unchanged"] += sub_diff["unchanged"]
+                
+                # 处理新增的元素（列表变长）
+                for i in range(len(old_data), len(new_data)):
+                    new_item = new_data[i]
+                    # 递归处理新增元素，提取其中的产品
+                    sub_diff = self._compare_data(
+                        {},  # 空的旧数据
+                        new_item,
+                        f"{path}[{i}]",
+                        stock_notify_mode=stock_notify_mode
+                    )
+                    
+                    if sub_diff["added"] or sub_diff["removed"] or sub_diff["modified"]:
+                        diff["added"].append({
+                            "path": f"{path}[{i}]",
+                            "value": new_item,
+                            "detail": sub_diff
+                        })
+                
+                # 处理删除的元素（列表变短）
+                for i in range(len(new_data), len(old_data)):
+                    old_item = old_data[i]
+                    diff["removed"].append({
+                        "path": f"{path}[{i}]",
+                        "value": old_item
+                    })
             else:
                 for i, (old_item, new_item) in enumerate(zip(old_data, new_data)):
                     sub_diff = self._compare_data(
@@ -1738,20 +1801,36 @@ class UpstreamMonitor:
                     """提取产品级别的变化信息"""
                     changes = []
                     
-                    # 处理新增的产品
+                    # 处理新增的产品/分组
                     for item in diff_item.get("added", []):
                         path = item.get("path", "")
-                        # 尝试解析路径获取产品信息
-                        product_info = parse_product_from_path(path, item.get("value"), "新增")
-                        if product_info:
-                            changes.append(product_info)
+                        value = item.get("value")
+                        detail = item.get("detail")
+                        
+                        # 如果有 detail，说明是复杂对象（如分组），需要递归处理
+                        if detail and (detail.get("added") or detail.get("removed") or detail.get("modified")):
+                            sub_changes = extract_product_changes(detail, old_data, new_data)
+                            changes.extend(sub_changes)
+                        else:
+                            # 简单对象，尝试解析为产品
+                            product_info = parse_product_from_path(path, value, "新增")
+                            if product_info:
+                                changes.append(product_info)
                     
-                    # 处理删除的产品
+                    # 处理删除的产品/分组
                     for item in diff_item.get("removed", []):
                         path = item.get("path", "")
-                        product_info = parse_product_from_path(path, item.get("value"), "删除")
-                        if product_info:
-                            changes.append(product_info)
+                        value = item.get("value")
+                        detail = item.get("detail")
+                        
+                        # 如果有 detail，说明是复杂对象，需要递归处理
+                        if detail and (detail.get("added") or detail.get("removed") or detail.get("modified")):
+                            sub_changes = extract_product_changes(detail, old_data, new_data)
+                            changes.extend(sub_changes)
+                        else:
+                            product_info = parse_product_from_path(path, value, "删除")
+                            if product_info:
+                                changes.append(product_info)
                     
                     # 处理修改的产品
                     for item in diff_item.get("modified", []):
@@ -1799,6 +1878,12 @@ class UpstreamMonitor:
                 
                 def parse_product_from_path(path, value, change_type):
                     """从路径解析产品信息"""
+                    # 只有产品级别的路径才解析（路径包含 products[id:] 或 products[数字]）
+                    import re
+                    is_product_path = re.search(r'products\[', path)
+                    if not is_product_path:
+                        return None
+                    
                     # 尝试从产品数据中提取信息
                     if isinstance(value, dict):
                         return {
@@ -2185,8 +2270,8 @@ class ConfigWizard:
         }
         print(f"\n库存监控: {mode_text.get(stock_notify_mode, stock_notify_mode)}")
         
-        # 显示邮件配置
-        email = config.get("email", {})
+        # 显示邮件配置（支持 email 和 smtp 两种键名）
+        email = config.get('email') or config.get('smtp', {})
         print(f"\n邮件通知: {'已启用' if email.get('enabled', False) else '未启用'}")
         if email.get("enabled"):
             print(f"  SMTP服务器: {email.get('smtp_server', 'N/A')}")
@@ -2300,7 +2385,12 @@ class ConfigWizard:
         """配置邮件"""
         print("\n--- 配置邮件通知 ---")
         
-        email = config.setdefault("email", {})
+        # 兼容旧配置（使用 smtp 键）和新配置（使用 email 键）
+        email = config.get('email') or config.get('smtp', {})
+        # 确保 email 键存在
+        config['email'] = email
+        # 清理旧的 smtp 键（如果存在）
+        config.pop('smtp', None)
         
         enabled = input(f"启用邮件通知? [{'Y' if email.get('enabled', False) else 'n'}/n]: ").strip().lower()
         if enabled == "y":
