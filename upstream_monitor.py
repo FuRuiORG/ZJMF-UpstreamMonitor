@@ -16,6 +16,7 @@ import logging
 import platform
 from contextlib import contextmanager
 from datetime import datetime
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any, List, Dict, Optional
 from email.mime.text import MIMEText
@@ -26,6 +27,49 @@ import requests
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+
+def setup_logging(log_level: str = 'INFO', log_file: str = None):
+    """
+    配置日志系统
+    
+    Args:
+        log_level: 日志级别 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file: 日志文件路径，默认为 None（仅控制台输出）
+    """
+    # 获取根日志器
+    root_logger = logging.getLogger()
+    
+    # 清除现有处理器（避免重复添加）
+    root_logger.handlers.clear()
+    
+    # 设置日志级别
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    root_logger.setLevel(level)
+    
+    # 日志格式
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # 文件处理器（可选）
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+        except Exception as e:
+            logger.warning(f"无法创建日志文件 {log_file}: {e}")
+    
+    return root_logger
 
 
 def get_data_dir() -> Path:
@@ -50,6 +94,10 @@ DATA_DIR = get_data_dir()
 class DatabaseManager:
     """数据库管理器"""
     
+    # 数据库锁重试配置
+    MAX_RETRIES = 5
+    RETRY_DELAY = 0.1  # 秒
+    
     def __init__(self, db_path: str = None):
         """
         初始化数据库
@@ -65,15 +113,47 @@ class DatabaseManager:
     @contextmanager
     def _get_connection(self):
         """获取数据库连接的上下文管理器"""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         try:
             yield conn
         finally:
             conn.close()
     
+    def _execute_with_retry(self, operation, *args, **kwargs):
+        """
+        执行数据库操作，支持自动重试
+        
+        Args:
+            operation: 要执行的函数，接收 conn 参数
+            *args, **kwargs: 传递给 operation 的参数
+            
+        Returns:
+            操作的返回值
+            
+        Raises:
+            sqlite3.OperationalError: 重试次数用尽后仍失败
+        """
+        last_error = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                with self._get_connection() as conn:
+                    return operation(conn, *args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    last_error = e
+                    if attempt < self.MAX_RETRIES - 1:
+                        logger.warning(f"数据库锁定，第 {attempt + 1} 次重试...")
+                        time.sleep(self.RETRY_DELAY * (attempt + 1))  # 递增延迟
+                        continue
+                raise
+        
+        # 重试次数用尽
+        logger.error(f"数据库操作失败，已重试 {self.MAX_RETRIES} 次")
+        raise last_error
+    
     def _init_database(self):
         """初始化数据库表结构"""
-        with self._get_connection() as conn:
+        def _create_tables(conn):
             cursor = conn.cursor()
             
             # 变化记录表（包含价格变化和其他字段变化）
@@ -114,6 +194,8 @@ class DatabaseManager:
             ''')
             
             conn.commit()
+        
+        self._execute_with_retry(_create_tables)
     
     def save_change_record(self, change_data: Dict):
         """
@@ -122,7 +204,7 @@ class DatabaseManager:
         Args:
             change_data: 变化数据
         """
-        with self._get_connection() as conn:
+        def _insert(conn, data):
             cursor = conn.cursor()
             
             cursor.execute('''
@@ -132,22 +214,24 @@ class DatabaseManager:
                  change_type, field_name, old_value, new_value, price_change, check_time)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                change_data.get('product_id'),
-                change_data.get('product_name'),
-                change_data['upstream_name'],
-                change_data.get('upstream_url'),
-                change_data.get('group_name'),
-                change_data.get('first_group_id'),
-                change_data.get('second_group_id'),
-                change_data['change_type'],
-                change_data.get('field_name'),
-                change_data.get('old_value'),
-                change_data.get('new_value'),
-                change_data.get('price_change'),
-                change_data['check_time']
+                data.get('product_id'),
+                data.get('product_name'),
+                data['upstream_name'],
+                data.get('upstream_url'),
+                data.get('group_name'),
+                data.get('first_group_id'),
+                data.get('second_group_id'),
+                data['change_type'],
+                data.get('field_name'),
+                data.get('old_value'),
+                data.get('new_value'),
+                data.get('price_change'),
+                data['check_time']
             ))
             
             conn.commit()
+        
+        self._execute_with_retry(_insert, change_data)
     
     def get_recent_changes(self, hours: int = 24) -> List[Dict]:
         """
@@ -271,6 +355,20 @@ class SMTPNotifier:
         except Exception:
             return str(value)[:max_length]
     
+    def _escape_html(self, value: Any) -> str:
+        """
+        HTML 转义，防止 XSS 攻击
+        
+        Args:
+            value: 要转义的值
+            
+        Returns:
+            转义后的安全字符串
+        """
+        if value is None:
+            return ''
+        return html_escape(str(value))
+    
     def _generate_text_email(self, changes: List[Dict], upstream_name: str, change_type: str = "价格", reshuffling_info: Dict = None) -> str:
         """生成纯文本邮件内容"""
         content = f"上游监控 - {change_type}变化通知\n"
@@ -343,6 +441,10 @@ class SMTPNotifier:
     
     def _generate_html_email(self, changes: List[Dict], upstream_name: str, change_type: str = "价格", reshuffling_info: Dict = None) -> str:
         """生成 HTML 邮件内容"""
+        # 预转义所有动态内容，防止 XSS
+        safe_upstream_name = self._escape_html(upstream_name)
+        safe_change_type = self._escape_html(change_type)
+        
         html = f"""
         <!DOCTYPE html>
         <html lang="zh-CN">
@@ -644,14 +746,14 @@ class SMTPNotifier:
             <div class="email-container">
                 <div class="header">
                     <div class="logo">FuRuiORG Monitor</div>
-                    <h1 class="title">{change_type}变化通知</h1>
+                    <h1 class="title">{safe_change_type}变化通知</h1>
                     <p class="subtitle">上游产品监控检测到数据变化</p>
                 </div>
                 
                 <div class="meta-info">
                     <div class="meta-row">
                         <span class="meta-label">上游</span>
-                        <span class="meta-value">{upstream_name}</span>
+                        <span class="meta-value">{safe_upstream_name}</span>
                     </div>
                     <div class="meta-row">
                         <span class="meta-label">检测时间</span>
@@ -742,11 +844,12 @@ class SMTPNotifier:
         
         if reshuffling_info and reshuffling_info.get('is_reshuffling'):
             reshuffling_type_text = '循环交换' if reshuffling_info.get('reshuffling_type') == 'circular_exchange' else '互换'
+            safe_summary = self._escape_html(reshuffling_info.get('summary', 'N/A'))
             html += f"""
                 <div class="reshuffling-banner">
                     <h3>⚠️ 检测到产品信息重组</h3>
                     <p><strong>类型：</strong>{reshuffling_type_text}</p>
-                    <p><strong>概述：</strong>{reshuffling_info.get('summary', 'N/A')}</p>
+                    <p><strong>概述：</strong>{safe_summary}</p>
                 </div>
                 
                 <div class="section-title">重组详情</div>
@@ -754,21 +857,24 @@ class SMTPNotifier:
             
             for group in reshuffling_info.get('groups', []):
                 group_type = '循环交换' if group.get('is_circular') else '互换'
+                safe_group_name = self._escape_html(group.get('group_name', 'N/A'))
                 html += f"""
                 <div class="reshuffling-group">
-                    <h4>分组：{group.get('group_name', 'N/A')}</h4>
+                    <h4>分组：{safe_group_name}</h4>
                     <p><strong>涉及产品数：</strong>{group.get('reshuffled_count', 0)} 个</p>
                     <p><strong>模式：</strong>{group_type}</p>
                     <p style="margin-top: 12px;"><strong>产品身份转移详情：</strong></p>
                 """
                 
                 for mapping in group.get('mappings', []):
+                    safe_original_name = self._escape_html(mapping.get('original_name', 'N/A'))
+                    safe_new_name = self._escape_html(mapping.get('new_name_at_old_id', 'N/A'))
                     html += f"""
                     <div class="mapping-item">
                         <strong>原 ID {mapping.get('original_id')}</strong> 
-                        ({mapping.get('original_name')}，¥{mapping.get('original_price')})<br>
+                        ({safe_original_name}，¥{mapping.get('original_price')})<br>
                         → <strong>转移到 ID {mapping.get('moved_to_id')}</strong><br>
-                        <small>（该 ID 现在的名称：{mapping.get('new_name_at_old_id')}，价格：¥{mapping.get('new_price_at_old_id')}）</small>
+                        <small>（该 ID 现在的名称：{safe_new_name}，价格：¥{mapping.get('new_price_at_old_id')}）</small>
                     </div>
                     """
                 
@@ -799,12 +905,18 @@ class SMTPNotifier:
                 arrow = "↑" if change['change_type'] == 'increase' else "↓"
                 product_url = change.get('product_url', change.get('upstream_url', ''))
                 
+                # HTML 转义
+                safe_product_name = self._escape_html(change.get('product_name', 'N/A'))
+                safe_upstream = self._escape_html(change.get('upstream_name', 'N/A'))
+                safe_group_name = self._escape_html(change.get('group_name', 'N/A'))
+                safe_product_url = self._escape_html(product_url)
+                
                 reshuffling_badge = '<span class="change-type" style="background-color: #171717; color: #fff; margin-left: 8px;">重组</span><span style="font-size: 11px; color: #737373; margin-left: 8px;">（修改内容可能不准确，仅参考）</span>' if is_reshuffling_product else ''
                 
                 html += f"""
                 <div class="change-card">
                     <div class="change-header">
-                        <span style="font-size: 13px; font-weight: 500; color: #171717;"><span style="color: #737373; margin-right: 8px;">#{change_index}</span>{change.get('product_name', 'N/A')}</span>
+                        <span style="font-size: 13px; font-weight: 500; color: #171717;"><span style="color: #737373; margin-right: 8px;">#{change_index}</span>{safe_product_name}</span>
                         <div>
                             <span class="change-type {type_class}">{price_change_type}</span>{reshuffling_badge}
                         </div>
@@ -812,11 +924,11 @@ class SMTPNotifier:
                     <div class="change-body">
                         <div class="change-row">
                             <span class="change-label">上游</span>
-                            <span class="change-value">{change.get('upstream_name', 'N/A')}</span>
+                            <span class="change-value">{safe_upstream}</span>
                         </div>
                         <div class="change-row">
                             <span class="change-label">所属分组</span>
-                            <span class="change-value">{change.get('group_name', 'N/A')}</span>
+                            <span class="change-value">{safe_group_name}</span>
                         </div>
                         <div class="change-row">
                             <span class="change-label">产品 ID</span>
@@ -836,7 +948,7 @@ class SMTPNotifier:
                         </div>
                         <div class="change-row">
                             <span class="change-label">购买链接</span>
-                            <span class="change-value"><a href="{product_url}" class="change-link">查看产品</a></span>
+                            <span class="change-value"><a href="{safe_product_url}" class="change-link">查看产品</a></span>
                         </div>
                     </div>
                 </div>
@@ -854,10 +966,16 @@ class SMTPNotifier:
                 
                 field_display_name = get_field_display_name(change.get('field_name', 'N/A'))
                 
+                # HTML 转义
+                safe_product_name = self._escape_html(change.get('product_name', 'N/A'))
+                safe_upstream = self._escape_html(change.get('upstream_name', 'N/A'))
+                safe_group_name = self._escape_html(change.get('group_name', 'N/A'))
+                safe_field_name = self._escape_html(field_display_name)
+                
                 html += f"""
                 <div class="change-card">
                     <div class="change-header">
-                        <span style="font-size: 13px; font-weight: 500; color: #171717;"><span style="color: #737373; margin-right: 8px;">#{change_index}</span>{change.get('product_name', 'N/A')}</span>
+                        <span style="font-size: 13px; font-weight: 500; color: #171717;"><span style="color: #737373; margin-right: 8px;">#{change_index}</span>{safe_product_name}</span>
                         <div>
                             <span class="change-type {type_class}">{category}</span>{reshuffling_badge}
                         </div>
@@ -865,7 +983,7 @@ class SMTPNotifier:
                     <div class="change-body">
                         <div class="change-row">
                             <span class="change-label">上游</span>
-                            <span class="change-value">{change.get('upstream_name', 'N/A')}</span>
+                            <span class="change-value">{safe_upstream}</span>
                         </div>
                         <div class="change-row">
                             <span class="change-label">产品 ID</span>
@@ -873,40 +991,44 @@ class SMTPNotifier:
                         </div>
                         <div class="change-row">
                             <span class="change-label">所属分组</span>
-                            <span class="change-value">{change.get('group_name', 'N/A')}</span>
+                            <span class="change-value">{safe_group_name}</span>
                         </div>
                         <div class="change-row">
                             <span class="change-label">修改字段</span>
-                            <span class="change-value">{field_display_name}</span>
+                            <span class="change-value">{safe_field_name}</span>
                         </div>
                 """
                 upstream_url = change.get('upstream_url', '')
                 first_group_id = change.get('first_group_id', '')
                 second_group_id = change.get('second_group_id', '')
                 if upstream_url and first_group_id and second_group_id:
+                    safe_cart_url = self._escape_html(f"{upstream_url}/cart?fid={first_group_id}&gid={second_group_id}")
                     html += f"""
                         <div class="change-row">
                             <span class="change-label">产品链接</span>
-                            <span class="change-value"><a href="{upstream_url}/cart?fid={first_group_id}&gid={second_group_id}" class="change-link">查看产品</a></span>
+                            <span class="change-value"><a href="{safe_cart_url}" class="change-link">查看产品</a></span>
                         </div>
                     """
                 
                 if category == "修改":
+                    old_val = self._escape_html(self._format_value_for_email(change.get('old_value', ''), 1000))
+                    new_val = self._escape_html(self._format_value_for_email(change.get('new_value', ''), 1000))
                     html += f"""
                         <div class="change-row" style="flex-direction: column;">
                             <span class="change-label" style="margin-bottom: 8px;">旧值</span>
-                            <div class="code-block">{self._format_value_for_email(change.get('old_value', ''), 1000)}</div>
+                            <div class="code-block">{old_val}</div>
                         </div>
                         <div class="change-row" style="flex-direction: column; margin-top: 12px;">
                             <span class="change-label" style="margin-bottom: 8px;">新值</span>
-                            <div class="code-block">{self._format_value_for_email(change.get('new_value', ''), 1000)}</div>
+                            <div class="code-block">{new_val}</div>
                         </div>
                     """
                 else:
+                    val = self._escape_html(self._format_value_for_email(change.get('new_value', change.get('value', '')), 1000))
                     html += f"""
                         <div class="change-row" style="flex-direction: column;">
                             <span class="change-label" style="margin-bottom: 8px;">值</span>
-                            <div class="code-block">{self._format_value_for_email(change.get('new_value', change.get('value', '')), 1000)}</div>
+                            <div class="code-block">{val}</div>
                         </div>
                     """
                 if category == "删除":
@@ -918,6 +1040,7 @@ class SMTPNotifier:
                     """
                 html += "</div></div>"
             else:
+                change_val = self._escape_html(self._format_value_for_email(change, 1000))
                 html += f"""
                 <div class="change-card">
                     <div class="change-header">
@@ -925,7 +1048,7 @@ class SMTPNotifier:
                         <span class="change-type type-modified">其他</span>
                     </div>
                     <div class="change-body">
-                        <div class="code-block">{self._format_value_for_email(change, 1000)}</div>
+                        <div class="code-block">{change_val}</div>
                     </div>
                 </div>
                 """
@@ -962,6 +1085,60 @@ class UpstreamMonitor:
             compare_stock = config.get('compare_stock', True)
             stock_notify_mode = "disabled" if not compare_stock else "full"
         return stock_notify_mode
+    
+    @staticmethod
+    def _parse_price(price_value: Any, product_id: str = '', product_name: str = '') -> float:
+        """
+        安全解析价格值，处理各种异常格式
+        
+        Args:
+            price_value: 原始价格值（可能是字符串、数字、None等）
+            product_id: 产品ID（用于日志）
+            product_name: 产品名称（用于日志）
+            
+        Returns:
+            解析后的价格数值，解析失败返回 0.0
+        """
+        if price_value is None:
+            return 0.0
+        
+        # 已经是数字类型
+        if isinstance(price_value, (int, float)):
+            return float(price_value)
+        
+        # 转换为字符串处理
+        price_str = str(price_value).strip()
+        
+        if not price_str:
+            return 0.0
+        
+        # 常见的免费标识
+        free_keywords = ['免费', 'free', '赠品', '试用', '0.00', '0', '无']
+        if price_str.lower() in [k.lower() for k in free_keywords]:
+            return 0.0
+        
+        # 清理价格字符串：移除货币符号、单位、空格等
+        import re
+        # 移除常见货币符号和单位
+        cleaned = re.sub(r'[¥￥$€£￥元块]|RMB|USD|CNY|人民币|美元', '', price_str)
+        # 移除千位分隔符
+        cleaned = cleaned.replace(',', '').replace('，', '')
+        # 移除前后空格
+        cleaned = cleaned.strip()
+        
+        # 提取第一个数字（包括小数点）
+        match = re.search(r'-?\d+\.?\d*', cleaned)
+        if match:
+            try:
+                return float(match.group())
+            except ValueError:
+                pass
+        
+        # 无法解析，记录警告
+        if price_str not in ['0', '0.0', '']:
+            logger.warning(f"无法解析价格值 '{price_value}' (产品ID: {product_id}, 名称: {product_name})")
+        
+        return 0.0
     
     def __init__(self, config_file: str = None):
         """
@@ -1359,9 +1536,9 @@ class UpstreamMonitor:
         
         return diff
 
-    def _extract_products(self, data: dict, upstream_name: str, upstream_url: str) -> List[Dict]:
+    def _extract_products_full(self, data: dict, upstream_name: str, upstream_url: str) -> Dict:
         """
-        从 API 响应数据中提取产品信息
+        从 API 响应数据中提取产品信息及预构建映射（单次遍历优化）
         
         Args:
             data: API 响应数据
@@ -1369,12 +1546,20 @@ class UpstreamMonitor:
             upstream_url: 上游 URL
             
         Returns:
-            产品信息列表
+            包含以下字段的字典：
+            - products: 产品信息列表
+            - desc_map: 产品ID -> 描述的映射
+            - by_id: 产品ID -> 产品的映射
+            - by_group: 分组key -> {'name': 分组名, 'products': 产品列表} 的映射
         """
-        products = []
+        result = {
+            'products': [],
+            'desc_map': {},
+            'by_id': {},
+            'by_group': {}
+        }
         
         try:
-            # 遍历数据结构
             if 'data' in data and 'first_group' in data['data']:
                 for first_group in data['data']['first_group']:
                     first_group_id = str(first_group.get('id', ''))
@@ -1382,23 +1567,23 @@ class UpstreamMonitor:
                         for group in first_group['group']:
                             second_group_id = str(group.get('id', ''))
                             group_name = group.get('name', '未分组')
+                            group_key = f"{first_group_id}|{second_group_id}"
+                            
                             if 'products' in group:
                                 for product in group['products']:
                                     product_id = str(product.get('id', ''))
                                     product_name = product.get('name', '')
                                     original_price = product.get('product_price', '0')
+                                    description = product.get('description', '')
                                     
                                     # 拼接产品 URL
                                     base_url = upstream_url.rstrip('/')
                                     product_url = f"{base_url}/cart?fid={first_group_id}&gid={second_group_id}"
                                     
-                                    # 转换价格为数字
-                                    try:
-                                        price_numeric = float(original_price)
-                                    except (ValueError, TypeError):
-                                        price_numeric = 0.0
+                                    # 转换价格为数字（增强版，处理各种异常格式）
+                                    price_numeric = self._parse_price(original_price, product_id, product_name)
                                     
-                                    products.append({
+                                    product_info = {
                                         'product_id': product_id,
                                         'product_name': product_name,
                                         'upstream_name': upstream_name,
@@ -1411,29 +1596,56 @@ class UpstreamMonitor:
                                         'current_price': original_price,
                                         'price_numeric': price_numeric,
                                         'check_time': datetime.now().isoformat()
-                                    })
+                                    }
+                                    
+                                    # 构建所有映射
+                                    result['products'].append(product_info)
+                                    result['desc_map'][product_id] = description
+                                    result['by_id'][product_id] = product_info
+                                    
+                                    # 按分组归类
+                                    if group_key not in result['by_group']:
+                                        result['by_group'][group_key] = {'name': group_name, 'products': []}
+                                    result['by_group'][group_key]['products'].append(product_info)
         except Exception as e:
             logger.error(f"提取产品信息时出错：{str(e)}")
             print(f"提取产品信息时出错：{str(e)}")
         
-        return products
+        return result
+    
+    def _extract_products(self, data: dict, upstream_name: str, upstream_url: str) -> List[Dict]:
+        """
+        从 API 响应数据中提取产品信息（兼容旧接口）
+        
+        Args:
+            data: API 响应数据
+            upstream_name: 上游名称
+            upstream_url: 上游 URL
+            
+        Returns:
+            产品信息列表
+        """
+        return self._extract_products_full(data, upstream_name, upstream_url)['products']
 
-    def _check_price_changes(self, old_products: List[Dict], new_products: List[Dict]) -> List[Dict]:
+    def _check_price_changes(self, old_products: List[Dict], new_products: List[Dict],
+                             old_by_id: Dict = None, new_by_id: Dict = None) -> List[Dict]:
         """
         检查价格变化
         
         Args:
             old_products: 旧产品列表（已提取）
             new_products: 新产品列表（已提取）
+            old_by_id: 预构建的旧产品ID映射（可选，避免重复遍历）
+            new_by_id: 预构建的新产品ID映射（可选，避免重复遍历）
             
         Returns:
             价格变化列表
         """
         changes = []
         
-        # 创建产品 ID 到产品的映射
-        old_product_map = {p['product_id']: p for p in old_products}
-        new_product_map = {p['product_id']: p for p in new_products}
+        # 使用预构建映射或现场构建
+        old_product_map = old_by_id if old_by_id else {p['product_id']: p for p in old_products}
+        new_product_map = new_by_id if new_by_id else {p['product_id']: p for p in new_products}
         
         # 检查现有产品的价格变化
         for product_id, new_product in new_product_map.items():
@@ -1467,7 +1679,9 @@ class UpstreamMonitor:
         return changes
 
     def _detect_product_reshuffling(self, old_products: List[Dict], new_products: List[Dict],
-                                    old_desc_map: Dict[str, str], new_desc_map: Dict[str, str]) -> Dict:
+                                    old_desc_map: Dict[str, str], new_desc_map: Dict[str, str],
+                                    old_by_id: Dict = None, new_by_id: Dict = None,
+                                    old_by_group: Dict = None, new_by_group: Dict = None) -> Dict:
         """
         检测产品信息重组模式
         
@@ -1481,6 +1695,10 @@ class UpstreamMonitor:
             new_products: 新产品列表（已提取）
             old_desc_map: 旧产品描述映射
             new_desc_map: 新产品描述映射
+            old_by_id: 预构建的旧产品ID映射（可选）
+            new_by_id: 预构建的新产品ID映射（可选）
+            old_by_group: 预构建的旧分组映射（可选）
+            new_by_group: 预构建的新分组映射（可选）
             
         Returns:
             重组检测结果，包含是否检测到重组、重组详情等
@@ -1492,22 +1710,25 @@ class UpstreamMonitor:
             "summary": ""
         }
         
-        old_by_id = {p['product_id']: p for p in old_products}
-        new_by_id = {p['product_id']: p for p in new_products}
+        # 使用预构建映射或现场构建
+        old_by_id = old_by_id if old_by_id else {p['product_id']: p for p in old_products}
+        new_by_id = new_by_id if new_by_id else {p['product_id']: p for p in new_products}
         
-        old_by_group = {}
-        for p in old_products:
-            group_key = f"{p['first_group_id']}|{p['second_group_id']}"
-            if group_key not in old_by_group:
-                old_by_group[group_key] = {'name': p['group_name'], 'products': []}
-            old_by_group[group_key]['products'].append(p)
+        if old_by_group is None:
+            old_by_group = {}
+            for p in old_products:
+                group_key = f"{p['first_group_id']}|{p['second_group_id']}"
+                if group_key not in old_by_group:
+                    old_by_group[group_key] = {'name': p['group_name'], 'products': []}
+                old_by_group[group_key]['products'].append(p)
         
-        new_by_group = {}
-        for p in new_products:
-            group_key = f"{p['first_group_id']}|{p['second_group_id']}"
-            if group_key not in new_by_group:
-                new_by_group[group_key] = {'name': p['group_name'], 'products': []}
-            new_by_group[group_key]['products'].append(p)
+        if new_by_group is None:
+            new_by_group = {}
+            for p in new_products:
+                group_key = f"{p['first_group_id']}|{p['second_group_id']}"
+                if group_key not in new_by_group:
+                    new_by_group[group_key] = {'name': p['group_name'], 'products': []}
+                new_by_group[group_key]['products'].append(p)
         
         reshuffling_groups = []
         
@@ -1610,22 +1831,6 @@ class UpstreamMonitor:
         
         return result
     
-    def _build_product_description_map(self, data: dict) -> Dict[str, str]:
-        """构建产品ID到描述的映射，提高效率"""
-        desc_map = {}
-        try:
-            if 'data' in data and 'first_group' in data['data']:
-                for first_group in data['data']['first_group']:
-                    if 'group' in first_group:
-                        for group in first_group['group']:
-                            if 'products' in group:
-                                for product in group['products']:
-                                    product_id = str(product.get('id', ''))
-                                    desc_map[product_id] = product.get('description', '')
-        except Exception:
-            pass
-        return desc_map
-    
     def _check_circular_mapping(self, mappings: List[Dict]) -> bool:
         """检查映射是否形成循环"""
         if len(mappings) < 2:
@@ -1701,17 +1906,17 @@ class UpstreamMonitor:
         api_url = upstream["api_url"]
         base_url = upstream.get("base_url", api_url.rsplit("/v1/products", 1)[0] if "/v1/products" in api_url else api_url)
         
-        print(f"\n{'='*60}")
-        print(f"正在监控：{name}")
-        print(f"API URL: {api_url}")
-        print(f"{'='*60}")
+        logger.info("="*60)
+        logger.info(f"正在监控：{name}")
+        logger.info(f"API URL: {api_url}")
+        logger.info("="*60)
         
         # 获取新数据
         try:
             new_data = self._fetch_data(api_url)
-            print(f"✓ 成功获取新数据")
+            logger.info("成功获取新数据")
         except Exception as e:
-            print(f"✗ 获取数据失败：{str(e)}")
+            logger.error(f"获取数据失败：{str(e)}")
             return {
                 "success": False,
                 "error": str(e),
@@ -1724,7 +1929,7 @@ class UpstreamMonitor:
         # 检查是否存在初始数据
         if not initial_data_file.exists():
             # 首次运行，保存初始数据
-            print(f"首次运行，保存初始数据到：{initial_data_file}")
+            logger.info(f"首次运行，保存初始数据到：{initial_data_file}")
             with open(initial_data_file, "w", encoding="utf-8") as f:
                 json.dump(new_data, f, ensure_ascii=False, indent=2)
             
@@ -1744,7 +1949,7 @@ class UpstreamMonitor:
         new_hash = self._get_data_hash(new_data)
         
         if old_hash == new_hash:
-            print(f"✓ 数据无变化")
+            logger.info("数据无变化")
             return {
                 "success": True,
                 "upstream": name,
@@ -1753,7 +1958,7 @@ class UpstreamMonitor:
             }
         
         # 比较差异
-        print(f"检测到数据变化，正在比较差异...")
+        logger.info("检测到数据变化，正在比较差异...")
         timestamp = datetime.now()
         
         # 获取库存通知模式（支持新旧配置格式）
@@ -1764,32 +1969,43 @@ class UpstreamMonitor:
             "status_only": "仅在库存状态变化时通知（有货↔无货）",
             "disabled": "已禁用库存对比"
         }
-        print(f"  （库存模式：{mode_text.get(stock_notify_mode, stock_notify_mode)}）")
+        logger.debug(f"库存模式：{mode_text.get(stock_notify_mode, stock_notify_mode)}")
         
         diff = self._compare_data(old_data, new_data, stock_notify_mode=stock_notify_mode)
         
-        # 预先提取产品信息和描述映射（避免重复计算）
-        old_products = self._extract_products(old_data, name, base_url)
-        new_products = self._extract_products(new_data, name, base_url)
-        old_desc_map = self._build_product_description_map(old_data)
-        new_desc_map = self._build_product_description_map(new_data)
+        # 单次遍历提取所有产品和预构建映射（性能优化）
+        old_extracted = self._extract_products_full(old_data, name, base_url)
+        new_extracted = self._extract_products_full(new_data, name, base_url)
+        
+        old_products = old_extracted['products']
+        new_products = new_extracted['products']
         
         # 检查价格变化
-        price_changes = self._check_price_changes(old_products, new_products)
-        print(f"检测到 {len(price_changes)} 个产品价格变化")
+        price_changes = self._check_price_changes(
+            old_products, new_products,
+            old_by_id=old_extracted['by_id'],
+            new_by_id=new_extracted['by_id']
+        )
+        logger.info(f"检测到 {len(price_changes)} 个产品价格变化")
         
         # 检测产品重组
         reshuffling_info = self._detect_product_reshuffling(
-            old_products, new_products, old_desc_map, new_desc_map
+            old_products, new_products,
+            old_desc_map=old_extracted['desc_map'],
+            new_desc_map=new_extracted['desc_map'],
+            old_by_id=old_extracted['by_id'],
+            new_by_id=new_extracted['by_id'],
+            old_by_group=old_extracted['by_group'],
+            new_by_group=new_extracted['by_group']
         )
         if reshuffling_info.get('is_reshuffling'):
-            print(f"⚠️ 检测到产品信息重组：{reshuffling_info.get('summary', '')}")
+            logger.warning(f"检测到产品信息重组：{reshuffling_info.get('summary', '')}")
         
-        print(f"检测到变化：")
-        print(f"  - 新增：{len(diff['added'])} 项")
-        print(f"  - 删除：{len(diff['removed'])} 项")
-        print(f"  - 修改：{len(diff['modified'])} 项")
-        print(f"  - 价格变化：{len(price_changes)} 项")
+        logger.info(f"检测到变化：")
+        logger.info(f"  - 新增：{len(diff['added'])} 项")
+        logger.info(f"  - 删除：{len(diff['removed'])} 项")
+        logger.info(f"  - 修改：{len(diff['modified'])} 项")
+        logger.info(f"  - 价格变化：{len(price_changes)} 项")
         
         # 发送邮件通知 - 只要有任何变化就发送
         if self.notifier:
@@ -2106,12 +2322,12 @@ class UpstreamMonitor:
                 self.notifier.send_change_email(all_changes, name, "数据", reshuffling_info)
                 # 保存变化记录到数据库
                 self._save_changes_to_db(all_changes, timestamp.isoformat())
-                print(f"✓ 已保存 {len(all_changes)} 条变化记录到数据库")
+                logger.info(f"已保存 {len(all_changes)} 条变化记录到数据库")
         
         # 更新初始数据为新数据
         with open(initial_data_file, "w", encoding="utf-8") as f:
             json.dump(new_data, f, ensure_ascii=False, indent=2)
-        print(f"✓ 初始数据已更新")
+        logger.info("初始数据已更新")
         
         return {
             "success": True,
@@ -2130,40 +2346,40 @@ class UpstreamMonitor:
 
     def run(self):
         """运行监控"""
-        print(f"上游产品信息监控（带价格检测和邮件通知）")
-        print(f"开始时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("上游产品信息监控（带价格检测和邮件通知）")
+        logger.info(f"开始时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         results = []
         for upstream in self.config.get("upstreams", []):
             if not upstream.get("enabled", True):
-                print(f"\n跳过已禁用的上游：{upstream['name']}")
+                logger.info(f"跳过已禁用的上游：{upstream['name']}")
                 continue
             
             result = self.monitor_upstream(upstream)
             results.append(result)
         
         # 输出总结
-        print(f"\n{'='*60}")
-        print(f"监控完成")
-        print(f"结束时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*60}")
+        logger.info("="*60)
+        logger.info("监控完成")
+        logger.info(f"结束时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("="*60)
         
         for result in results:
             upstream_name = result.get("upstream", "未知")
             if not result.get("success"):
-                print(f"✗ {upstream_name}: 失败 - {result.get('error', '未知错误')}")
+                logger.error(f"{upstream_name}: 失败 - {result.get('error', '未知错误')}")
             elif result.get("is_first_run"):
-                print(f"✓ {upstream_name}: 首次运行，已保存初始数据")
+                logger.info(f"{upstream_name}: 首次运行，已保存初始数据")
             elif not result.get("has_changes"):
-                print(f"✓ {upstream_name}: 数据无变化")
+                logger.info(f"{upstream_name}: 数据无变化")
             else:
                 summary = result.get("summary", {})
                 reshuffling_info = result.get("reshuffling_info")
                 
                 if reshuffling_info and reshuffling_info.get('is_reshuffling'):
-                    print(f"⚠️ {upstream_name}: 检测到产品重组！{reshuffling_info.get('summary', '')}")
+                    logger.warning(f"{upstream_name}: 检测到产品重组！{reshuffling_info.get('summary', '')}")
                 else:
-                    print(f"✓ {upstream_name}: 检测到变化 "
+                    logger.info(f"{upstream_name}: 检测到变化 "
                           f"(新增:{summary.get('added_count', 0)}, "
                           f"删除:{summary.get('removed_count', 0)}, "
                           f"修改:{summary.get('modified_count', 0)}, "
@@ -2473,6 +2689,13 @@ class ConfigWizard:
 
 def main():
     """主函数"""
+    # 初始化日志系统
+    # 可以通过环境变量 LOG_LEVEL 设置日志级别
+    log_level = os.environ.get('LOG_LEVEL', 'INFO')
+    # 可以通过环境变量 LOG_FILE 设置日志文件路径
+    log_file = os.environ.get('LOG_FILE', None)
+    setup_logging(log_level, log_file)
+    
     if len(sys.argv) > 1 and sys.argv[1] == "--config":
         # 配置模式
         wizard = ConfigWizard()
