@@ -6,6 +6,9 @@ upstream_diffs/
 #示例文件
 example/
 
+# AI 上下文文件
+AGENTS.md
+
 # 压缩包
 *.zip
 *.tar.gz
