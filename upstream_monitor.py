@@ -1217,11 +1217,16 @@ class UpstreamMonitor:
         
         # 如果是列表
         elif isinstance(old_data, list) and isinstance(new_data, list):
-            # 检测是否是 products 列表，需要按产品ID匹配而不是按索引
-            is_products_list = path.endswith('.products') or path.endswith('products')
+            # 检测是否是需要按ID匹配的列表（products、first_group、group）
+            # 这些列表都有 'id' 字段，应该按ID匹配而不是按索引匹配
+            is_id_based_list = (
+                path.endswith('.products') or path.endswith('products') or
+                path.endswith('.first_group') or path.endswith('first_group') or
+                path.endswith('.group') or path.endswith('group')
+            )
             
-            if is_products_list:
-                # 按 ID 匹配产品，避免顺序变化导致误报
+            if is_id_based_list:
+                # 按 ID 匹配，避免顺序变化导致误报
                 old_by_id = {}
                 new_by_id = {}
                 
@@ -1236,37 +1241,37 @@ class UpstreamMonitor:
                 old_ids = set(old_by_id.keys())
                 new_ids = set(new_by_id.keys())
                 
-                # 新增的产品
-                for product_id in new_ids - old_ids:
-                    new_item = new_by_id[product_id]
+                # 新增的项目
+                for item_id in new_ids - old_ids:
+                    new_item = new_by_id[item_id]
                     diff["added"].append({
-                        "path": f"{path}[id:{product_id}]",
+                        "path": f"{path}[id:{item_id}]",
                         "value": new_item
                     })
                 
-                # 删除的产品
-                for product_id in old_ids - new_ids:
-                    old_item = old_by_id[product_id]
+                # 删除的项目
+                for item_id in old_ids - new_ids:
+                    old_item = old_by_id[item_id]
                     diff["removed"].append({
-                        "path": f"{path}[id:{product_id}]",
+                        "path": f"{path}[id:{item_id}]",
                         "value": old_item
                     })
                 
-                # 修改的产品（同一个ID的产品内容变化）
-                for product_id in old_ids & new_ids:
-                    old_item = old_by_id[product_id]
-                    new_item = new_by_id[product_id]
+                # 修改的项目（同一个ID的内容变化）
+                for item_id in old_ids & new_ids:
+                    old_item = old_by_id[item_id]
+                    new_item = new_by_id[item_id]
                     
                     sub_diff = self._compare_data(
                         old_item,
                         new_item,
-                        f"{path}[id:{product_id}]",
+                        f"{path}[id:{item_id}]",
                         stock_notify_mode=stock_notify_mode
                     )
                     
                     if sub_diff["added"] or sub_diff["removed"] or sub_diff["modified"]:
                         diff["modified"].append({
-                            "path": f"{path}[id:{product_id}]",
+                            "path": f"{path}[id:{item_id}]",
                             "old_value": old_item,
                             "new_value": new_item,
                             "detail": sub_diff
