@@ -426,7 +426,10 @@ class SMTPNotifier:
                 second_group_id = change.get('second_group_id', '')
                 if upstream_url and first_group_id and second_group_id:
                     content += f"产品链接：{upstream_url}/cart?fid={first_group_id}&gid={second_group_id}\n"
-                if category == "修改":
+                if category == "分组变更":
+                    content += f"原分组：{change.get('old_group_name', 'N/A')} (ID: {change.get('old_group_id', 'N/A')})\n"
+                    content += f"新分组：{change.get('new_group_name', 'N/A')} (ID: {change.get('new_group_id', 'N/A')})\n"
+                elif category == "修改":
                     content += f"旧值：{self._format_value_for_email(change.get('old_value', 'N/A'))}\n"
                     content += f"新值：{self._format_value_for_email(change.get('new_value', 'N/A'))}\n"
                 else:
@@ -771,6 +774,7 @@ class SMTPNotifier:
         added_count = sum(1 for c in changes if c.get('change_category') == '新增')
         removed_count = sum(1 for c in changes if c.get('change_category') == '删除')
         modified_count = sum(1 for c in changes if c.get('change_category') == '修改')
+        group_move_count = sum(1 for c in changes if c.get('change_category') == '分组变更')
         reshuffling_item_count = sum(1 for c in changes if 'is_reshuffling_item' in c)
         
         field_name_map = {
@@ -802,7 +806,7 @@ class SMTPNotifier:
         
         html += f"""
                 <div class="section-title">变化概况</div>
-                <div class="stats-grid" style="grid-template-columns: repeat(5, 1fr);">
+                <div class="stats-grid" style="grid-template-columns: repeat(6, 1fr);">
                     <div class="stat-item">
                         <div class="stat-number" style="color: #dc2626;">{price_increase_count}</div>
                         <div class="stat-label">涨价</div>
@@ -822,6 +826,10 @@ class SMTPNotifier:
                     <div class="stat-item">
                         <div class="stat-number" style="color: #dc2626;">{removed_count}</div>
                         <div class="stat-label">删除</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" style="color: #7c3aed;">{group_move_count}</div>
+                        <div class="stat-label">分组变更</div>
                     </div>
                 </div>
         """
@@ -959,6 +967,8 @@ class SMTPNotifier:
                     type_class = "type-added"
                 elif category == "删除":
                     type_class = "type-removed"
+                elif category == "分组变更":
+                    type_class = "type-modified"
                 else:
                     type_class = "type-modified"
                 
@@ -1010,7 +1020,23 @@ class SMTPNotifier:
                         </div>
                     """
                 
-                if category == "修改":
+                if category == "分组变更":
+                    # 分组变更的特殊处理：显示原分组和新分组
+                    old_group_name = self._escape_html(change.get('old_group_name', 'N/A'))
+                    new_group_name = self._escape_html(change.get('new_group_name', 'N/A'))
+                    old_group_id = change.get('old_group_id', 'N/A')
+                    new_group_id = change.get('new_group_id', 'N/A')
+                    html += f"""
+                        <div class="change-row" style="flex-direction: column;">
+                            <span class="change-label" style="margin-bottom: 8px;">原分组</span>
+                            <div class="code-block">{old_group_name} (ID: {old_group_id})</div>
+                        </div>
+                        <div class="change-row" style="flex-direction: column; margin-top: 12px;">
+                            <span class="change-label" style="margin-bottom: 8px;">新分组</span>
+                            <div class="code-block">{new_group_name} (ID: {new_group_id})</div>
+                        </div>
+                    """
+                elif category == "修改":
                     old_val = self._escape_html(self._format_value_for_email(change.get('old_value', ''), 1000))
                     new_val = self._escape_html(self._format_value_for_email(change.get('new_value', ''), 1000))
                     html += f"""
@@ -2017,9 +2043,22 @@ class UpstreamMonitor:
             
             # 添加其他数据变化（新增、删除、修改但非价格）
             if diff.get("added") or diff.get("removed") or diff.get("modified"):
+                # 用于追踪分组移动的产品，避免重复报告
+                group_move_reported = set()
+                group_moves = []  # 收集所有分组变更
+                
                 # 从产品角度提取变化信息
-                def extract_product_changes(diff_item, old_data_map, new_data_map):
-                    """提取产品级别的变化信息"""
+                def extract_product_changes(diff_item, old_data_map, new_data_map, old_by_id_ref, new_by_id_ref):
+                    """提取产品级别的变化信息
+                    
+                    Args:
+                        diff_item: 差异数据
+                        old_data_map: 旧数据
+                        new_data_map: 新数据
+                        old_by_id_ref: 旧产品ID映射
+                        new_by_id_ref: 新产品ID映射
+                    """
+                    nonlocal group_move_reported, group_moves
                     changes = []
                     
                     # 处理新增的产品/分组
@@ -2030,13 +2069,35 @@ class UpstreamMonitor:
                         
                         # 如果有 detail，说明是复杂对象（如分组），需要递归处理
                         if detail and (detail.get("added") or detail.get("removed") or detail.get("modified")):
-                            sub_changes = extract_product_changes(detail, old_data, new_data)
+                            sub_changes = extract_product_changes(detail, old_data, new_data, old_by_id_ref, new_by_id_ref)
                             changes.extend(sub_changes)
                         else:
                             # 简单对象，尝试解析为产品
-                            product_info = parse_product_from_path(path, value, "新增")
+                            product_info = parse_product_from_path(path, value, "新增", old_by_id_ref, new_by_id_ref)
                             if product_info:
-                                changes.append(product_info)
+                                # 检查是否是分组移动（产品ID在旧数据中存在）
+                                product_id = str(product_info.get("product_id", ""))
+                                if product_id in old_by_id_ref:
+                                    # 这是分组移动，不是真正的新增
+                                    if product_id not in group_move_reported:
+                                        group_move_reported.add(product_id)
+                                        old_product = old_by_id_ref[product_id]
+                                        new_product = new_by_id_ref.get(product_id, {})
+                                        group_moves.append({
+                                            "change_category": "分组变更",
+                                            "product_id": product_id,
+                                            "product_name": product_info.get("product_name", new_product.get("product_name", "N/A")),
+                                            "upstream_name": name,
+                                            "upstream_url": base_url,
+                                            "field_name": "所属分组",
+                                            "old_group_name": old_product.get("group_name", "N/A"),
+                                            "new_group_name": new_product.get("group_name", "N/A"),
+                                            "old_group_id": f"{old_product.get('first_group_id', '')}|{old_product.get('second_group_id', '')}",
+                                            "new_group_id": f"{new_product.get('first_group_id', '')}|{new_product.get('second_group_id', '')}"
+                                        })
+                                else:
+                                    # 真正的新增
+                                    changes.append(product_info)
                     
                     # 处理删除的产品/分组
                     for item in diff_item.get("removed", []):
@@ -2046,12 +2107,19 @@ class UpstreamMonitor:
                         
                         # 如果有 detail，说明是复杂对象，需要递归处理
                         if detail and (detail.get("added") or detail.get("removed") or detail.get("modified")):
-                            sub_changes = extract_product_changes(detail, old_data, new_data)
+                            sub_changes = extract_product_changes(detail, old_data, new_data, old_by_id_ref, new_by_id_ref)
                             changes.extend(sub_changes)
                         else:
-                            product_info = parse_product_from_path(path, value, "删除")
+                            product_info = parse_product_from_path(path, value, "删除", old_by_id_ref, new_by_id_ref)
                             if product_info:
-                                changes.append(product_info)
+                                # 检查是否是分组移动（产品ID在新数据中仍然存在）
+                                product_id = str(product_info.get("product_id", ""))
+                                if product_id in new_by_id_ref:
+                                    # 这是分组移动，不是真正的删除，已在"新增"处理中记录
+                                    pass
+                                else:
+                                    # 真正的删除
+                                    changes.append(product_info)
                     
                     # 处理修改的产品
                     for item in diff_item.get("modified", []):
@@ -2071,7 +2139,7 @@ class UpstreamMonitor:
                                     changes.extend(field_changes)
                             else:
                                 # 无法获取产品信息，直接递归处理子差异
-                                sub_changes = extract_product_changes(detail, old_data, new_data)
+                                sub_changes = extract_product_changes(detail, old_data, new_data, old_by_id_ref, new_by_id_ref)
                                 changes.extend(sub_changes)
                         else:
                             # 叶子节点，直接显示字段变化
@@ -2097,8 +2165,16 @@ class UpstreamMonitor:
                     
                     return changes
                 
-                def parse_product_from_path(path, value, change_type):
-                    """从路径解析产品信息"""
+                def parse_product_from_path(path, value, change_type, old_by_id_ref, new_by_id_ref):
+                    """从路径解析产品信息
+                    
+                    Args:
+                        path: 数据路径
+                        value: 产品数据
+                        change_type: 变化类型（新增/删除）
+                        old_by_id_ref: 旧产品ID映射
+                        new_by_id_ref: 新产品ID映射
+                    """
                     # 只有产品级别的路径才解析（路径包含 products[id:] 或 products[数字]）
                     import re
                     is_product_path = re.search(r'products\[', path)
@@ -2314,9 +2390,13 @@ class UpstreamMonitor:
                     
                     return field_changes
                 
-                # 从产品角度提取变化
-                product_changes = extract_product_changes(diff, old_data, new_data)
+                # 从产品角度提取变化，传入产品ID映射以区分分组移动
+                product_changes = extract_product_changes(diff, old_data, new_data, old_by_id, new_by_id)
                 all_changes.extend(product_changes)
+                
+                # 添加分组变更
+                if group_moves:
+                    all_changes.extend(group_moves)
             
             if all_changes:
                 self.notifier.send_change_email(all_changes, name, "数据", reshuffling_info)
